@@ -16,7 +16,7 @@ import traceback
 import uuid
 import zipfile
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 from xml.sax.saxutils import escape
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
@@ -39,12 +39,86 @@ RT_LLM_MODEL = "Qwen/Qwen2.5-72B-Instruct"
 RT_LLM_MAX_NEW_TOKENS = 1536
 RT_LLM_MAX_PROMPT_CHARS = 24000
 
+
+def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except Exception:
+        value = default
+    return max(minimum, min(maximum, value))
+
+
+# Генерация изображений потенциально самая долгая часть пайплайна. Эти лимиты
+# не дают Yandex ART или /download заблокировать всю презентацию на много минут.
+RT_IMAGE_POST_TIMEOUT = _env_int("RT_IMAGE_POST_TIMEOUT", 20, 5, 90)
+RT_IMAGE_REQUEST_TIMEOUT = _env_int("RT_IMAGE_REQUEST_TIMEOUT", 12, 3, 60)
+RT_IMAGE_DOWNLOAD_REQUEST_TIMEOUT = _env_int("RT_IMAGE_DOWNLOAD_REQUEST_TIMEOUT", 20, 5, 60)
+RT_IMAGE_DOWNLOAD_TIMEOUT = _env_int("RT_IMAGE_DOWNLOAD_TIMEOUT", 60, 15, 180)
+RT_IMAGE_SINGLE_TIMEOUT = _env_int("RT_IMAGE_SINGLE_TIMEOUT", 70, 20, 180)
+RT_IMAGE_BATCH_TIMEOUT = _env_int("RT_IMAGE_BATCH_TIMEOUT", 270, 60, 600)
+RT_IMAGE_MAX_IMAGES = _env_int("RT_IMAGE_MAX_IMAGES", 20, 1, 50)
+# Fallback на SD включён по умолчанию: если yaArt недоступен (rate limit/таймаут), пробуем SD.
+RT_IMAGE_ALLOW_BACKEND_FALLBACK = os.getenv("RT_IMAGE_ALLOW_BACKEND_FALLBACK", "1") == "1"
+# При 429 (rate limit) делаем паузу и повторяем попытку в рамках общего дедлайна.
+RT_IMAGE_RATELIMIT_PAUSE = _env_int("RT_IMAGE_RATELIMIT_PAUSE", 8, 1, 60)
+RT_IMAGE_POST_RETRIES = _env_int("RT_IMAGE_POST_RETRIES", 1, 0, 3)
+# Circuit breaker: сколько подряд ошибок одного бэкенда разрешено до его отключения в батче.
+RT_IMAGE_CIRCUIT_BREAKER_THRESHOLD = _env_int("RT_IMAGE_CIRCUIT_BREAKER_THRESHOLD", 2, 1, 10)
+
 app = FastAPI(title="PresentAI")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 JOBS: dict[str, dict] = {}
 # Токены и runtime-контекст живут только в памяти процесса и не пишутся в JSON/PPTX.
 SESSION_SECRETS: dict[str, dict] = {}
+
+
+ProgressCallback = Callable[[int, str, str], None]
+
+
+def _job_update(
+    job_id: str,
+    progress: Optional[int] = None,
+    title: Optional[str] = None,
+    detail: Optional[str] = None,
+    status: Optional[str] = None,
+    result: Optional[dict] = None,
+    error: Optional[str] = None,
+) -> None:
+    """Обновляет публичный статус фоновой генерации без раскрытия токенов и файлов."""
+    job = JOBS.get(job_id)
+    if not job:
+        return
+    if progress is not None:
+        current = int(job.get("progress", 0) or 0)
+        job["progress"] = max(current, max(0, min(100, int(progress))))
+    if title is not None:
+        job["title"] = title
+    if detail is not None:
+        job["detail"] = detail
+    if status is not None:
+        job["status"] = status
+    if result is not None:
+        job["result"] = result
+    if error is not None:
+        job["error"] = error
+    job["updated_at"] = time.time()
+
+
+def _job_public_status(job_id: str, job: dict) -> dict:
+    """Возвращает только данные, которые безопасно показывать странице загрузки."""
+    result = job.get("result") if isinstance(job.get("result"), dict) else {}
+    return {
+        "job_id": job_id,
+        "status": job.get("status", "queued"),
+        "progress": int(job.get("progress", 0) or 0),
+        "title": job.get("title", "Ожидаем запуска"),
+        "detail": job.get("detail", ""),
+        "error": job.get("error", ""),
+        "session_id": result.get("session_id", ""),
+        "created_at": job.get("created_at"),
+        "updated_at": job.get("updated_at"),
+    }
 
 # ── Извлечение текста из документов ───────────────────────────────────────────
 
@@ -1294,7 +1368,7 @@ def _download_url_image(url: str, token: str, req_module: object) -> bytes:
         full_url = url
     headers = {"Authorization": f"Bearer {token}", "Accept": "image/png,image/*,*/*"}
     try:
-        resp = req_module.get(full_url, headers=headers, timeout=60)
+        resp = req_module.get(full_url, headers=headers, timeout=RT_IMAGE_REQUEST_TIMEOUT)
         if resp.status_code >= 400:
             _set_image_error(f"GET URL {resp.status_code}: {_short_rt_body(resp)}")
             return b""
@@ -1335,6 +1409,7 @@ def _download_rt_image_file(
     service_type: object,
     preferred_service: object,
     req_module: object,
+    timeout_seconds: Optional[float] = None,
 ) -> tuple[bytes, str]:
     """Опрашивает RT /download, пока реальный файл изображения не станет доступен."""
     services: list[str] = []
@@ -1346,25 +1421,35 @@ def _download_rt_image_file(
     if not services:
         services = ["sd", "yaArt"]
 
-    image_types = ["png", "jpeg", "bmp", "gif", "tiff"]
+    image_types = ["png", "jpeg"]
     headers = {
         "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
         "Accept": "image/png,image/jpeg,image/*;q=0.9,application/json;q=0.6,*/*;q=0.2",
     }
-    deadline = time.time() + 110
+    deadline = time.time() + max(1, min(RT_IMAGE_DOWNLOAD_TIMEOUT, timeout_seconds or RT_IMAGE_DOWNLOAD_TIMEOUT))
     attempt = 0
     last_error = ""
 
     while time.time() < deadline:
         for svc in services:
             for image_type in image_types:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    break
                 try:
                     resp = req_module.get(
                         f"{RT_API_BASE}/download",
                         params={"id": msg_id, "serviceType": svc, "imageType": image_type},
                         headers=headers,
-                        timeout=65,
+                        timeout=max(1, min(RT_IMAGE_DOWNLOAD_REQUEST_TIMEOUT, remaining)),
                     )
+                    if resp.status_code == 429:
+                        last_error = f"download id={msg_id}, serviceType={svc}: HTTP 429 (rate limit)"
+                        remaining_after = deadline - time.time()
+                        if remaining_after > RT_IMAGE_RATELIMIT_PAUSE:
+                            time.sleep(RT_IMAGE_RATELIMIT_PAUSE)
+                        continue
                     if resp.status_code >= 400:
                         last_error = f"download id={msg_id}, serviceType={svc}, imageType={image_type}: HTTP {resp.status_code} {_short_rt_body(resp)}"
                         continue
@@ -1376,8 +1461,11 @@ def _download_rt_image_file(
                     last_error = f"download id={msg_id}, serviceType={svc}: ответ не является изображением; Content-Type={content_type}; body={body}"
                 except Exception as e:
                     last_error = f"download id={msg_id}, serviceType={svc}: {e}"
+            if time.time() >= deadline:
+                break
         attempt += 1
-        time.sleep(min(1.5 + attempt * 0.45, 5.0))
+        if time.time() < deadline:
+            time.sleep(min(1.2 + attempt * 0.35, 3.0, max(0.1, deadline - time.time())))
 
     return b"", last_error or f"download id={msg_id}: файл не появился за время ожидания"
 
@@ -1415,31 +1503,43 @@ def _post_rt_image_job(prompt: str, token: str, service: str, translate: bool, r
         }
         endpoint = f"{RT_API_BASE}/sd/img"
 
-    try:
-        resp = req_module.post(endpoint, json=payload, headers=headers, timeout=100)
-        if resp.status_code >= 400:
-            return None, service, b"", f"POST {endpoint} HTTP {resp.status_code}: {_short_rt_body(resp)}"
-        content = resp.content or b""
-        direct_image = _normalize_generated_image_bytes(content)
-        if direct_image:
-            return None, service, direct_image, ""
+    last_err = ""
+    for attempt in range(max(1, RT_IMAGE_POST_RETRIES + 1)):
         try:
-            data = resp.json()
-        except Exception:
-            data = _decode_json_bytes(content)
-        if data is None:
-            return None, service, b"", f"POST {endpoint}: ответ не JSON и не изображение: {_short_rt_body(resp)}"
-        direct_image = _image_bytes_from_json_payload(data)
-        if direct_image:
-            return None, service, direct_image, ""
-        message = _extract_rt_message(data)
-        msg_id = message.get("id") or message.get("messageId") or message.get("message_id")
-        returned_service = message.get("serviceType") or service
-        if not msg_id:
-            return None, returned_service, b"", f"POST {endpoint}: в ответе нет message.id; фрагмент={str(data)[:320]}"
-        return msg_id, returned_service, b"", ""
-    except Exception as e:
-        return None, service, b"", f"POST {endpoint}: {e}"
+            resp = req_module.post(endpoint, json=payload, headers=headers, timeout=RT_IMAGE_POST_TIMEOUT)
+            if resp.status_code == 429:
+                last_err = f"POST {endpoint} HTTP 429 (rate limit): {_short_rt_body(resp)}"
+                if attempt < RT_IMAGE_POST_RETRIES:
+                    time.sleep(RT_IMAGE_RATELIMIT_PAUSE)
+                    continue
+                return None, service, b"", last_err
+            if resp.status_code >= 400:
+                return None, service, b"", f"POST {endpoint} HTTP {resp.status_code}: {_short_rt_body(resp)}"
+            content = resp.content or b""
+            direct_image = _normalize_generated_image_bytes(content)
+            if direct_image:
+                return None, service, direct_image, ""
+            try:
+                data = resp.json()
+            except Exception:
+                data = _decode_json_bytes(content)
+            if data is None:
+                return None, service, b"", f"POST {endpoint}: ответ не JSON и не изображение: {_short_rt_body(resp)}"
+            direct_image = _image_bytes_from_json_payload(data)
+            if direct_image:
+                return None, service, direct_image, ""
+            message = _extract_rt_message(data)
+            msg_id = message.get("id") or message.get("messageId") or message.get("message_id")
+            returned_service = message.get("serviceType") or service
+            if not msg_id:
+                return None, returned_service, b"", f"POST {endpoint}: в ответе нет message.id; фрагмент={str(data)[:320]}"
+            return msg_id, returned_service, b"", ""
+        except Exception as e:
+            last_err = f"POST {endpoint}: {e}"
+            # На таймаут сразу возвращаем ошибку — ждать смысла нет.
+            if "timed out" in str(e).lower() or "timeout" in str(e).lower():
+                return None, service, b"", last_err
+    return None, service, b"", last_err
 
 
 def _prepare_image_prompt(prompt: object) -> str:
@@ -1472,18 +1572,22 @@ def generate_image_rt(prompt: str, token: str, service: str = "sd") -> Optional[
         return None
 
     image_prompt = _prepare_image_prompt(prompt)
+    deadline = time.time() + RT_IMAGE_SINGLE_TIMEOUT
     requested_service = _normalize_rt_image_service(service)
     service_order = [requested_service]
-    # Если выбранный backend не вернул файл, пробуем второй RT image backend.
     other_service = "sd" if requested_service == "yaArt" else "yaArt"
-    if other_service not in service_order:
+    if RT_IMAGE_ALLOW_BACKEND_FALLBACK and other_service not in service_order:
         service_order.append(other_service)
 
     errors: list[str] = []
     for svc in service_order:
-        # В документации используется translate=false; translate=true помогает
-        # с русскими инструкциями при ручном редактировании отдельных слайдов.
-        for translate in (False, True):
+        # translate=true нужен только для русскоязычного image prompt; для английских
+        # prompt-ов лишняя попытка обычно просто удваивает время ожидания.
+        translate_options = (False, True) if re.search(r"[А-Яа-яЁё]", image_prompt) else (False,)
+        for translate in translate_options:
+            if time.time() >= deadline:
+                errors.append(f"{svc}: превышен лимит {RT_IMAGE_SINGLE_TIMEOUT} секунд на одно изображение")
+                break
             msg_id, returned_service, direct_image, post_error = _post_rt_image_job(
                 image_prompt, token, svc, translate, req
             )
@@ -1496,10 +1600,20 @@ def generate_image_rt(prompt: str, token: str, service: str = "sd") -> Optional[
                 errors.append(f"{svc}: RT API не вернул id задания изображения")
                 continue
 
-            image, download_error = _download_rt_image_file(msg_id, token, returned_service, svc, req)
+            remaining = max(1, deadline - time.time())
+            image, download_error = _download_rt_image_file(
+                msg_id,
+                token,
+                returned_service,
+                svc,
+                req,
+                timeout_seconds=remaining,
+            )
             if image:
                 return image
             errors.append(download_error or f"{svc}: /download не вернул файл изображения")
+            if time.time() >= deadline:
+                break
 
     _set_image_error(" | ".join(x for x in errors if x) or "RT API изображений не вернул файл")
     print(f"Image generation failed: {LAST_IMAGE_ERROR}")
@@ -2052,19 +2166,32 @@ def create_presentation_from_data(
     rt_service: str,
     document_filename: str = "",
     document_content: bytes = b"",
+    progress_callback: Optional[ProgressCallback] = None,
 ) -> dict:
     """Полный pipeline генерации: документ -> структура -> QA -> картинки -> PPTX."""
+    def progress(percent: int, title: str, detail: str = "") -> None:
+        if progress_callback:
+            progress_callback(percent, title, detail)
+
     style = normalize_style(style)
     session_id = str(uuid.uuid4())
     output_path = str(WORK_DIR / f"{session_id}.pptx")
 
+    progress(3, "Чтение входных данных", "Проверяем параметры и загруженный документ.")
     doc_text = extract_document_text(document_filename, document_content)
+    if doc_text:
+        progress(12, "Документ прочитан", "Текст PDF/DOCX извлечён и добавлен в контекст.")
+    else:
+        progress(12, "Документ не загружен", "Будем строить презентацию по промпту пользователя.")
 
     slide_count = max(3, min(20, slide_count))
+    progress(22, "Генерация структуры", "LLM формирует заголовки, layout-ы и тезисы слайдов.")
     structure = generate_slide_structure(prompt, doc_text, slide_count, style, tone, rt_token)
+    progress(46, "Структура готова", "Запускаем QA-проверку и выравниваем плотность текста.")
     structure = review_and_refine_slide_structure(
         structure, prompt, doc_text, slide_count, style, tone, rt_token
     )
+    progress(60, "QA-проверка завершена", "Слайды нормализованы, готовим визуальную часть.")
     structure["_presentai_context"] = {
         # Этот блок сохраняется в JSON, чтобы результат можно было редактировать позже.
         "prompt": prompt,
@@ -2090,34 +2217,103 @@ def create_presentation_from_data(
     slides = structure.get("slides", [])
     image_warnings: list[str] = []
     if generate_images and rt_token.strip():
+        progress(64, "Генерация изображений", "Запрашиваем картинки через выбранный RT image API.")
+        image_started_at = time.time()
+        image_attempts = 0
+        image_successes = 0
+        image_slots = max(1, min(RT_IMAGE_MAX_IMAGES, len(slides)))
+        # Circuit breaker: счётчики последовательных ошибок по бэкенду.
+        _cb_fails: dict[str, int] = {}
+        _cb_disabled: set[str] = set()
+        _active_service = rt_service
+
+        def _cb_record_fail(svc: str) -> None:
+            _cb_fails[svc] = _cb_fails.get(svc, 0) + 1
+            if _cb_fails[svc] >= RT_IMAGE_CIRCUIT_BREAKER_THRESHOLD:
+                _cb_disabled.add(svc)
+
+        def _cb_record_ok(svc: str) -> None:
+            _cb_fails[svc] = 0
+            _cb_disabled.discard(svc)
+
         for idx, slide in enumerate(slides, start=1):
+            elapsed = time.time() - image_started_at
+            if elapsed >= RT_IMAGE_BATCH_TIMEOUT:
+                image_warnings.append(
+                    f"Генерация изображений остановлена после {int(elapsed)} секунд, чтобы не задерживать PPTX."
+                )
+                break
+            if image_attempts >= RT_IMAGE_MAX_IMAGES:
+                image_warnings.append(
+                    f"Обработаны первые {RT_IMAGE_MAX_IMAGES} запросов изображений, успешно добавлено: {image_successes}. Остальные пропущены, чтобы презентация не зависла."
+                )
+                break
+
+            # Если текущий сервис отключён circuit breaker-ом, попробуем альтернативный.
+            if _active_service in _cb_disabled:
+                alt = "sd" if _active_service == "yaArt" else "yaArt"
+                if alt not in _cb_disabled:
+                    _active_service = alt
+                    image_warnings.append(f"Переключились на {alt}: {rt_service} временно недоступен.")
+                else:
+                    image_warnings.append("Оба image-бэкенда недоступны, пропускаем оставшиеся картинки.")
+                    break
+
+            # Первый и последний слайды — титульный/финальный, изображения не нужны.
+            if idx == 1 or idx == len(slides):
+                slide.pop("imageData", None)
+                continue
+
             # Некоторые LLM-ответы не содержат image_prompt даже при включённых картинках.
             # Создаём запасной prompt, чтобы генерация действительно запускалась.
             _ensure_slide_image_prompt(slide, prompt)
             if slide.get("image_prompt"):
+                image_attempts += 1
+                image_progress = 64 + int((min(image_attempts - 1, image_slots) / image_slots) * 18)
+                progress(
+                    image_progress,
+                    f"Генерация изображения {image_attempts}/{image_slots}",
+                    f"Слайд {idx}: отправляем prompt в {_active_service}.",
+                )
                 ok, message = _generate_slide_image_if_needed(
                     slide,
                     rt_token.strip(),
-                    rt_service,
+                    _active_service,
                     topic=prompt,
                     instruction="",
                     force=False,
                 )
-                if not ok and not slide.get("imageData"):
-                    image_warnings.append(f"Слайд {idx}: {message}")
-                time.sleep(0.35)
+                if ok and slide.get("imageData"):
+                    image_successes += 1
+                    _cb_record_ok(_active_service)
+                else:
+                    _cb_record_fail(_active_service)
+                    if not slide.get("imageData"):
+                        image_warnings.append(f"Слайд {idx}: {message}")
+                progress(
+                    64 + int((min(image_attempts, image_slots) / image_slots) * 18),
+                    f"Изображение {image_attempts}/{image_slots} обработано",
+                    message,
+                )
+                inter_delay = RT_IMAGE_RATELIMIT_PAUSE if (not ok and "429" in (message or "")) else 0.5
+                time.sleep(inter_delay)
     elif generate_images:
+        progress(72, "Изображения пропущены", "Генерация включена, но RT-токен не задан.")
         image_warnings.append("Генерация изображений включена, но RT-токен не задан.")
         for slide in slides:
             slide.pop("imageData", None)
+    else:
+        progress(72, "Изображения отключены", "Переходим к сборке PPTX без генерации картинок.")
 
     if image_warnings:
         structure["image_generation_warning"] = " ".join(image_warnings[:8])
 
     structure["slides"] = slides
+    progress(88, "Сборка PPTX", "Создаём слайды, применяем тему и встраиваем изображения.")
     if not build_pptx(structure, output_path, style):
         raise HTTPException(500, "Ошибка генерации PPTX")
 
+    progress(96, "Сохранение результата", "Записываем PPTX и JSON-сессию для редактора.")
     with open(WORK_DIR / f"{session_id}.json", "w", encoding="utf-8") as f:
         json.dump(structure, f, ensure_ascii=False, indent=2)
 
@@ -2509,6 +2705,7 @@ h1{{margin:0 0 8px;font-size:clamp(28px,5vw,44px)}}p{{margin:0 0 24px;color:#a99
 .bar{{height:14px;background:#21143e;border-radius:999px;overflow:hidden;border:1px solid rgba(255,255,255,.08)}}
 .fill{{height:100%;width:0;background:linear-gradient(90deg,#8b5cf6,#ec4e99);border-radius:999px;transition:width .45s ease}}
 .steps{{display:grid;gap:10px;margin-top:24px;text-align:left}}.step{{padding:12px 14px;border-radius:12px;background:rgba(255,255,255,.04);color:#b9aad6}}.step.done{{color:#fff;background:rgba(34,211,238,.12)}}
+.meta{{margin-top:18px;color:#7f6aa8;font-size:13px}}
 .error{{display:none;margin-top:20px;padding:14px;border-radius:12px;background:rgba(239,68,68,.14);color:#fecaca;text-align:left;white-space:pre-wrap}}
 a{{color:#c4b5fd}}
 </style></head><body>
@@ -2524,6 +2721,7 @@ a{{color:#c4b5fd}}
     <div class="step" id="s3">Правка структуры, текста и визуального баланса</div>
     <div class="step" id="s4">Сборка PPTX и страницы результата</div>
   </div>
+  <div class="meta" id="meta">Ожидаем запуск задачи...</div>
   <div class="error" id="error"></div>
 </main>
 <script>
@@ -2532,35 +2730,76 @@ const percent = document.getElementById('percent');
 const fill = document.getElementById('fill');
 const title = document.getElementById('title');
 const sub = document.getElementById('sub');
+const meta = document.getElementById('meta');
+const error = document.getElementById('error');
 let value = 0;
-function setProgress(next) {{
+let finished = false;
+function setProgress(next, nextTitle, nextDetail) {{
   value = Math.max(value, Math.min(100, Math.round(next)));
   percent.textContent = value + '%';
   fill.style.width = value + '%';
+  if (nextTitle) title.textContent = nextTitle;
+  if (nextDetail) sub.textContent = nextDetail;
   if (value >= 18) document.getElementById('s1').classList.add('done');
   if (value >= 42) document.getElementById('s2').classList.add('done');
   if (value >= 70) document.getElementById('s3').classList.add('done');
   if (value >= 92) document.getElementById('s4').classList.add('done');
 }}
-const timer = setInterval(() => {{
-  const step = value < 50 ? 4 : value < 82 ? 2 : 1;
-  setProgress(Math.min(96, value + step));
-}}, 650);
-async function run() {{
+function showError(message) {{
+  finished = true;
+  error.style.display = 'block';
+  error.innerHTML = '<strong>Ошибка:</strong> ' + String(message || 'Неизвестная ошибка') + '<br><br><a href="/">Вернуться к форме</a>';
+}}
+async function pollStatus() {{
+  if (finished) return;
   try {{
-    setProgress(6);
-    const resp = await fetch('/api/jobs/' + encodeURIComponent(jobId) + '/run', {{method:'POST'}});
+    const resp = await fetch('/api/jobs/' + encodeURIComponent(jobId) + '/status', {{cache:'no-store'}});
+    const data = await resp.json().catch(() => ({{}}));
+    if (!resp.ok) throw new Error(data.detail || 'Не удалось получить статус');
+    setProgress(data.progress || 0, data.title, data.detail);
+    meta.textContent = data.status === 'running'
+      ? 'Задача выполняется на сервере. Проценты обновляются по реальным этапам.'
+      : data.status === 'queued'
+        ? 'Задача в очереди запуска.'
+        : '';
+    if (data.status === 'done' && data.session_id) {{
+      finished = true;
+      setProgress(100, 'Презентация готова', 'Открываем страницу скачивания и предпросмотра.');
+      setTimeout(() => {{ window.location.href = '/result/' + encodeURIComponent(data.session_id); }}, 700);
+    }}
+    if (data.status === 'error') {{
+      showError(data.error || 'Ошибка генерации');
+    }}
+  }} catch (err) {{
+    meta.textContent = 'Ждём ответ сервера статуса...';
+  }}
+}}
+async function run() {{
+  const pollTimer = setInterval(pollStatus, 700);
+  try {{
+    setProgress(1, 'Запускаем задачу', 'Передаём параметры генерации на сервер.');
+    await pollStatus();
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 360000);
+    const resp = await fetch('/api/jobs/' + encodeURIComponent(jobId) + '/run', {{
+      method:'POST',
+      signal: controller.signal
+    }});
+    clearTimeout(timeoutId);
     const data = await resp.json().catch(() => ({{}}));
     if (!resp.ok) throw new Error(data.detail || 'Ошибка генерации');
-    clearInterval(timer);
-    title.textContent = 'Презентация готова';
-    sub.textContent = 'Открываем страницу скачивания и предпросмотра.';
-    setProgress(100);
-    setTimeout(() => {{ window.location.href = '/result/' + encodeURIComponent(data.session_id); }}, 700);
+    if (data.session_id) {{
+      finished = true;
+      clearInterval(pollTimer);
+      setProgress(100, 'Презентация готова', 'Открываем страницу скачивания и предпросмотра.');
+      setTimeout(() => {{ window.location.href = '/result/' + encodeURIComponent(data.session_id); }}, 700);
+    }}
   }} catch (err) {{
-    clearInterval(timer);
-    document.getElementById('error').style.display = 'block';
-    document.getElementById('error').innerHTML = '<strong>Ошибка:</strong> ' + String(err.message || err) + '<br><br><a href="/">Вернуться к форме</a>';
+    clearInterval(pollTimer);
+    const message = err.name === 'AbortError'
+      ? 'Сервер не ответил за 6 минут. Попробуйте выключить генерацию изображений или уменьшить количество слайдов.'
+      : String(err.message || err);
+    showError(message);
   }}
 }}
 run();
@@ -2620,18 +2859,35 @@ async def create_loading_job(
         "rt_service": rt_service,
         "document_filename": filename,
         "document_content": content,
+        "status": "queued",
+        "progress": 0,
+        "title": "Ожидаем запуска",
+        "detail": "Задача создана, страница загрузки запускает генерацию.",
+        "result": None,
+        "error": "",
         "created_at": time.time(),
+        "updated_at": time.time(),
     }
     return render_loading_page(job_id)
 
 
 @app.post("/api/jobs/{job_id}/run")
 async def run_loading_job(job_id: str):
-    job = JOBS.pop(job_id, None)
+    job = JOBS.get(job_id)
     if not job:
         raise HTTPException(404, "Задача генерации не найдена. Вернитесь к форме и запустите генерацию заново.")
+    if job.get("status") == "done" and isinstance(job.get("result"), dict):
+        return JSONResponse(job["result"])
+    if job.get("status") == "running":
+        return JSONResponse(_job_public_status(job_id, job))
     try:
-        data = create_presentation_from_data(
+        _job_update(job_id, 1, "Запуск генерации", "Сервер начал обработку задачи.", status="running")
+
+        def progress(percent: int, title: str, detail: str = "") -> None:
+            _job_update(job_id, percent, title, detail, status="running")
+
+        data = await asyncio.to_thread(
+            create_presentation_from_data,
             job["prompt"],
             job["slide_count"],
             job["style"],
@@ -2641,11 +2897,26 @@ async def run_loading_job(job_id: str):
             job["rt_service"],
             job["document_filename"],
             job["document_content"],
+            progress,
         )
+        job.pop("document_content", None)
+        job.pop("rt_token", None)
+        _job_update(job_id, 100, "Презентация готова", "Файл собран, открываем результат.", status="done", result=data)
         return JSONResponse(data)
     except Exception as e:
         traceback.print_exc()
+        job.pop("document_content", None)
+        job.pop("rt_token", None)
+        _job_update(job_id, None, "Ошибка генерации", str(e), status="error", error=str(e))
         raise HTTPException(500, str(e))
+
+
+@app.get("/api/jobs/{job_id}/status")
+async def loading_job_status(job_id: str):
+    job = JOBS.get(job_id)
+    if not job:
+        raise HTTPException(404, "Задача генерации не найдена")
+    return JSONResponse(_job_public_status(job_id, job))
 
 
 @app.post("/generate", response_class=HTMLResponse)
@@ -4051,7 +4322,7 @@ async function generate() {
   } catch (err) {
     if (progressTimer) clearInterval(progressTimer);
     const message = err.name === 'AbortError'
-      ? 'Сервер не ответил за 120 секунд. Попробуйте временно выключить генерацию изображений или повторить запрос.'
+      ? 'Сервер не ответил за 6 минут. Попробуйте временно выключить генерацию изображений или уменьшить количество слайдов.'
       : (err.message || String(err));
     showError(message);
   }
