@@ -18,6 +18,29 @@
 
 ## Запуск
 
+Нужен Python 3.10 или новее. Перед запуском перейдите в папку проекта.
+
+### Windows PowerShell
+
+```powershell
+cd путь\к\папке\hackathon
+py -3 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe iigenerator\app.py
+```
+
+Если PowerShell не разрешает запускать скрипты виртуального окружения, используйте команды выше именно через `.\.venv\Scripts\python.exe` - активация окружения не требуется.
+
+### Linux
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python iigenerator/app.py
+```
+
+### macOS
+
 ```bash
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
@@ -29,6 +52,8 @@ python3 -m venv .venv
 ```text
 http://localhost:8000
 ```
+
+Если страница в браузере не обновилась после изменений в коде, откройте `http://localhost:8000/?v=10` или нажмите `Ctrl+F5`.
 
 ## API-ключи
 
@@ -45,6 +70,9 @@ export ANTHROPIC_API_KEY=...
 ## Основные endpoints
 
 - `GET /` - веб-интерфейс;
+- `POST /loading` - отдельная страница загрузки с процентами;
+- `POST /api/jobs/{job_id}/run` - запуск задачи генерации со страницы загрузки;
+- `GET /result/{session_id}` - страница результата с предпросмотром и скачиванием;
 - `POST /api/generate` - генерация структуры и PPTX;
 - `POST /api/rebuild/{session_id}` - пересборка PPTX после редактирования;
 - `GET /api/download/{session_id}` - скачивание презентации.
