@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local configuration and secrets
+.codex
+.env
+.env.*
+!.env.example
+
+# Runtime output
+temp_files/
+*.log
+
+# Generated presentations
+*.pptx
+*.ppt
+
+# IDE and OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

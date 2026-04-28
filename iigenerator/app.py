@@ -1,31 +1,41 @@
 #!/usr/bin/env python3
 """
-PresentAI — AI Presentation Generator
+PresentAI — AI-генератор презентаций
 Hackathon: Амурский Код 2026 | Кейс: Ростелеком
 """
 
-import os, uuid, json, io, time, re, base64, traceback, zipfile, copy
-from pathlib import Path
-from typing import Optional, Any
-from xml.sax.saxutils import escape
 import asyncio
+import base64
+import copy
+import io
+import json
+import os
+import re
+import time
+import traceback
+import uuid
+import zipfile
+from pathlib import Path
+from typing import Any, Optional
+from xml.sax.saxutils import escape
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
-# ── Setup ─────────────────────────────────────────────────────────────────────
+# ── Настройка приложения ──────────────────────────────────────────────────────
 
-WORK_DIR = Path("./temp_files")
-WORK_DIR.mkdir(exist_ok=True)
 SCRIPT_DIR = Path(__file__).parent
+PROJECT_DIR = SCRIPT_DIR.parent
+WORK_DIR = Path(os.getenv("PRESENTAI_WORK_DIR") or PROJECT_DIR / "temp_files")
+WORK_DIR.mkdir(parents=True, exist_ok=True)
 
-# RT API (optional — used if token provided)
+# RT API используется только при наличии токена: без него приложение уходит в локальный запасной режим.
 RT_API_BASE = "https://ai.rt.ru/api/1.0"
 RT_LLM_MODEL = "Qwen/Qwen2.5-72B-Instruct"
-# The RT LLM endpoint is sensitive to oversized payloads. 1536 is the safe
-# documented output size for /llama/chat; larger values often return HTTP 400.
+# У RT LLM есть чувствительность к большим payload: лимиты ниже держат запросы
+# в стабильном диапазоне и уменьшают шанс HTTP 400 на длинных документах.
 RT_LLM_MAX_NEW_TOKENS = 1536
 RT_LLM_MAX_PROMPT_CHARS = 24000
 
@@ -33,9 +43,10 @@ app = FastAPI(title="PresentAI")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 JOBS: dict[str, dict] = {}
-SESSION_SECRETS: dict[str, dict] = {}  # runtime-only token/context storage; tokens are not written to disk
+# Токены и runtime-контекст живут только в памяти процесса и не пишутся в JSON/PPTX.
+SESSION_SECRETS: dict[str, dict] = {}
 
-# ── Document extraction ───────────────────────────────────────────────────────
+# ── Извлечение текста из документов ───────────────────────────────────────────
 
 def extract_text_from_pdf(data: bytes) -> str:
     try:
@@ -59,11 +70,36 @@ def extract_text_from_docx(data: bytes) -> str:
     except Exception as e:
         return f"[DOCX извлечение не удалось: {e}]"
 
-# ── LLM: generate slide structure ────────────────────────────────────────────
+# ── LLM: генерация структуры слайдов ─────────────────────────────────────────
 
 SYSTEM_PROMPT = """You are an expert presentation designer and content strategist.
 You generate structured JSON for professional presentations. Always respond ONLY with valid JSON.
 No markdown, no explanations, just the JSON object."""
+
+DEFAULT_STYLE = "deep_neon"
+# Старый ключ оставлен как алиас, чтобы ранее созданные сессии и ссылки не ломались.
+STYLE_ALIASES = {
+    "rostelecom": DEFAULT_STYLE,
+}
+STYLE_LABELS = {
+    DEFAULT_STYLE: "Глубокий неон",
+    "modern": "Тёмная волна",
+    "corporate": "Деловая",
+    "minimal": "Минимализм",
+    "tech": "Технологичная",
+    "creative": "Креативная",
+}
+
+
+def normalize_style(style: str) -> str:
+    value = (style or DEFAULT_STYLE).strip()
+    return STYLE_ALIASES.get(value, value)
+
+
+def style_label(style: str) -> str:
+    normalized = normalize_style(style)
+    return STYLE_LABELS.get(normalized, STYLE_LABELS[DEFAULT_STYLE])
+
 
 def build_generation_prompt(user_prompt: str, doc_text: str, slide_count: int,
                              style: str, tone: str) -> str:
@@ -83,7 +119,7 @@ def build_generation_prompt(user_prompt: str, doc_text: str, slide_count: int,
 Создай презентацию на русском языке.
 Тема: {user_prompt}
 Количество слайдов: {slide_count}
-Стиль: {style}
+Стиль: {style_label(style)}
 Тон: {tone_desc}{doc_section}
 
 Формат:
@@ -136,7 +172,7 @@ def _find_text_in_response(data: object) -> str:
     return ""
 
 def _decode_rt_response_body(resp: object, limit: int = 900) -> str:
-    """Decode RT API errors as UTF-8 so Russian messages are readable."""
+    """Декодирует ошибки RT API как UTF-8, чтобы русские сообщения были читаемыми."""
     if resp is None:
         return ""
     try:
@@ -150,7 +186,7 @@ def _decode_rt_response_body(resp: object, limit: int = 900) -> str:
     return text.strip()[:limit]
 
 def _safe_rt_max_tokens(value: int) -> int:
-    """Keep max_new_tokens inside the RT endpoint's stable range."""
+    """Удерживает max_new_tokens в рабочем диапазоне RT endpoint."""
     try:
         requested = int(value)
     except Exception:
@@ -158,7 +194,7 @@ def _safe_rt_max_tokens(value: int) -> int:
     return max(64, min(RT_LLM_MAX_NEW_TOKENS, requested))
 
 def _compact_rt_prompt(prompt: object, limit: int = RT_LLM_MAX_PROMPT_CHARS) -> str:
-    """Trim accidental huge prompts while preserving beginning and ending context."""
+    """Сжимает слишком большой промпт, сохраняя начало и конец контекста."""
     text = str(prompt or "").replace("\x00", "").strip()
     if len(text) <= limit:
         return text
@@ -344,7 +380,7 @@ def _normalize_slide_structure(data: dict, slide_count: int) -> dict:
     return data
 
 
-# ── Second LLM quality reviewer / slide editor ───────────────────────────────
+# ── Второй LLM-контролёр качества и редактор слайдов ─────────────────────────
 
 QUALITY_SYSTEM_PROMPT = """Ты — независимый второй LLM-агент контроля качества презентаций.
 Твоя задача — проверять структуру, достоверность, читаемость, визуальный баланс и при необходимости редактировать JSON слайдов.
@@ -468,7 +504,7 @@ def _sanitize_slide_for_quality(
     doc_keywords: Optional[set[str]] = None,
     doc_text: str = "",
 ) -> tuple[dict, list[dict], list[str]]:
-    """Apply deterministic safety edits so text does not overflow and slide order stays valid."""
+    """Приводит слайд к безопасному виду для PPTX и собирает QA-заметки."""
     s = copy.deepcopy(slide if isinstance(slide, dict) else {})
     issues: list[dict] = []
     corrections: list[str] = []
@@ -609,6 +645,7 @@ def _local_quality_review_and_edit(
     style: str,
     tone: str,
 ) -> dict:
+    """Локальный QA-фильтр на случай, если внешний LLM-контролёр недоступен."""
     reviewed = _normalize_slide_structure(copy.deepcopy(structure), slide_count)
     doc_keywords = _doc_keyword_set(doc_text)
     issues: list[dict] = []
@@ -646,7 +683,7 @@ LLM_STRIPPED_RUNTIME_KEYS = {
 }
 
 def _strip_runtime_fields_for_llm(value: object, key: str = "") -> object:
-    """Remove generated base64/images and other runtime-only fields before sending JSON to LLM."""
+    """Удаляет base64, изображения и runtime-поля перед отправкой JSON во вторую LLM."""
     if key in LLM_STRIPPED_RUNTIME_KEYS:
         return None
     if isinstance(value, dict):
@@ -692,7 +729,7 @@ def build_quality_review_prompt(
 - Нужно ровно {slide_count} слайдов.
 - Первый слайд: layout title.
 - Последний слайд: layout conclusion.
-- Тема оформления: {style}.
+- Тема оформления: {style_label(style)}.
 - Тон: {tone}.
 - Язык: русский.
 - Не удаляй поля image_prompt, если они релевантны.
@@ -732,7 +769,7 @@ def build_quality_review_prompt(
 }}"""
 
 def _merge_runtime_slide_fields(candidate: dict, original: dict) -> dict:
-    """Keep runtime-only fields (imageData, generated image prompt fallbacks) after LLM review."""
+    """Возвращает runtime-поля после QA-LLM, чтобы не потерять картинки и image_prompt."""
     result = copy.deepcopy(candidate)
     old_slides = original.get("slides", []) or []
     new_slides = result.get("slides", []) or []
@@ -774,7 +811,7 @@ def review_and_refine_slide_structure(
     tone: str,
     rt_token: str = "",
 ) -> dict:
-    """Second-model pass: LLM quality review if token exists, local deterministic cleanup otherwise."""
+    """Второй проход: QA через LLM при наличии токена, иначе локальная чистка."""
     base = _normalize_slide_structure(copy.deepcopy(structure), slide_count)
     review_errors: list[str] = []
 
@@ -793,7 +830,7 @@ def review_and_refine_slide_structure(
             candidate = _normalize_slide_structure(candidate, slide_count)
             candidate = _merge_runtime_slide_fields(candidate, base)
 
-            # Deterministic pass after LLM to prevent overflow even if the QA answer is imperfect.
+            # Детерминированная проверка нужна даже после LLM, чтобы текст не переполнял PPTX.
             locally_checked = _local_quality_review_and_edit(candidate, user_prompt, doc_text, slide_count, style, tone)
             llm_report = obj.get("quality_review") if isinstance(obj.get("quality_review"), dict) else candidate.get("quality_review", {})
             local_report = locally_checked.get("quality_review", {})
@@ -999,14 +1036,18 @@ def save_session_structure(session_id: str, structure: dict, style: str) -> None
         json.dump(structure, f, ensure_ascii=False, indent=2)
 
 def _session_context(structure: dict, session_id: str = "") -> dict:
+    """Объединяет сохранённый контекст и runtime-секреты текущей сессии."""
     context = structure.get("_presentai_context") if isinstance(structure.get("_presentai_context"), dict) else {}
     runtime = SESSION_SECRETS.get(session_id, {}) if session_id else {}
     merged = {**context, **runtime}
+    if "style" in merged:
+        merged["style"] = normalize_style(merged["style"])
     return merged
 
 def generate_slide_structure(user_prompt: str, doc_text: str,
                                slide_count: int, style: str, tone: str,
                                rt_token: str = "") -> dict:
+    """Пробует RT LLM, затем Anthropic fallback, затем локальную демо-структуру."""
     prompt = build_generation_prompt(user_prompt, doc_text, slide_count, style, tone)
     errors = []
 
@@ -1016,6 +1057,7 @@ def generate_slide_structure(user_prompt: str, doc_text: str,
             try:
                 structure = _normalize_slide_structure(_extract_json_object(rt_text), slide_count)
             except Exception:
+                # Иногда LLM отвечает осмысленным текстом вместо JSON; сохраняем демо-работоспособность.
                 structure = _normalize_slide_structure(_structure_from_plain_text(rt_text, user_prompt, slide_count, style, tone), slide_count)
                 structure["generation_warning"] = "RT LLM вернула текст не в JSON-формате, слайды собраны из текста ответа."
             structure["generation_source"] = "RT LLM"
@@ -1039,20 +1081,20 @@ def generate_slide_structure(user_prompt: str, doc_text: str,
         structure["generation_warning"] = "Использован локальный fallback: API-токен LLM не задан."
     return _normalize_slide_structure(structure, slide_count)
 
-# ── Image generation (RT API) ─────────────────────────────────────────────────
+# ── Генерация изображений через RT API ────────────────────────────────────────
 
 LAST_IMAGE_ERROR = ""
 
 
 def _set_image_error(message: object) -> None:
-    """Store the last image API failure so the UI can show a useful reason."""
+    """Запоминает последнюю ошибку image API, чтобы UI показал понятную причину."""
     global LAST_IMAGE_ERROR
     text = _clean_text(message)
     LAST_IMAGE_ERROR = text[:900]
 
 
 def _normalize_rt_image_service(service: object) -> str:
-    """Normalize UI/API service names to RT service identifiers used by endpoints."""
+    """Нормализует имя сервиса из UI к идентификаторам RT endpoints."""
     value = str(service or "").strip().lower().replace("-", "_").replace(" ", "")
     if value in {"ya", "yandex", "yandexart", "yandex_art", "yaart", "арт", "yandexарт"}:
         return "yaArt"
@@ -1060,7 +1102,7 @@ def _normalize_rt_image_service(service: object) -> str:
 
 
 def _rt_image_service_candidates(service: object) -> list[str]:
-    """RT download is strict about serviceType; try documented and common variants."""
+    """Подбирает варианты serviceType: RT download чувствителен к точному значению."""
     normalized = _normalize_rt_image_service(service)
     candidates: list[str] = []
 
@@ -1072,8 +1114,8 @@ def _rt_image_service_candidates(service: object) -> list[str]:
     add(normalized)
     if normalized == "yaArt":
         add("yaArt")
-        # The Yandex ART doc has a typo in the serviceType description, so keep
-        # an SD fallback for /download while still posting to /ya/image first.
+        # В описании Yandex ART встречается неоднозначный serviceType, поэтому
+        # для /download держим запасной SD-вариант, хотя job создаём через /ya/image.
         add("sd")
     else:
         add("sd")
@@ -1082,7 +1124,7 @@ def _rt_image_service_candidates(service: object) -> list[str]:
 
 
 def _guess_image_mime(data: bytes) -> str:
-    """Best-effort MIME detection for images returned by RT download."""
+    """Определяет MIME изображения по сигнатуре байтов без внешних зависимостей."""
     data = data or b""
     if data.startswith(b"\x89PNG\r\n\x1a\n"):
         return "image/png"
@@ -1113,7 +1155,7 @@ def _is_supported_image_bytes(data: bytes) -> bool:
 
 
 def _normalize_generated_image_bytes(data: bytes) -> bytes:
-    """Return bytes that python-pptx can embed, converting exotic formats to PNG."""
+    """Возвращает байты, которые python-pptx сможет встроить; экзотику переводит в PNG."""
     if not data:
         return b""
     if data.startswith(b"\x89PNG\r\n\x1a\n") or data.startswith(b"\xff\xd8\xff") or data.startswith(b"GIF87a") or data.startswith(b"GIF89a") or data.startswith(b"BM"):
@@ -1133,7 +1175,7 @@ def _normalize_generated_image_bytes(data: bytes) -> bytes:
 
 
 def _image_bytes_from_text(text: object) -> bytes:
-    """Extract a real image from data URLs or raw base64 strings."""
+    """Достаёт изображение из data URL или сырой base64-строки."""
     if not isinstance(text, str):
         return b""
     value = text.strip()
@@ -1154,7 +1196,7 @@ def _image_bytes_from_text(text: object) -> bytes:
 
 
 def _image_bytes_from_json_payload(obj: object) -> bytes:
-    """RT may wrap files/base64 in JSON; recursively search for image data."""
+    """RT иногда заворачивает файл/base64 в JSON; рекурсивно ищем данные картинки."""
     if isinstance(obj, str):
         return _image_bytes_from_text(obj)
     if isinstance(obj, list):
@@ -1180,7 +1222,7 @@ def _image_bytes_from_json_payload(obj: object) -> bytes:
 
 
 def _urls_from_json_payload(obj: object) -> list[str]:
-    """Collect URL fields from a possible JSON response from /download."""
+    """Собирает URL-поля из JSON-ответа /download."""
     urls: list[str] = []
 
     def add(value: object) -> None:
@@ -1214,7 +1256,7 @@ def _decode_json_bytes(data: bytes) -> object:
 
 
 def _extract_rt_message(data: object) -> dict:
-    """Find the nested RT message object in image generation response."""
+    """Находит вложенный объект message в ответе RT image API."""
     if isinstance(data, dict):
         message = data.get("message")
         if isinstance(message, dict):
@@ -1240,7 +1282,7 @@ def _short_rt_body(resp: object, limit: int = 280) -> str:
 
 
 def _download_url_image(url: str, token: str, req_module: object) -> bytes:
-    """Download an image from a URL returned by RT JSON, preserving authorization."""
+    """Скачивает изображение по URL из RT JSON, сохраняя Authorization."""
     if not url:
         return b""
     from urllib.parse import urljoin
@@ -1269,7 +1311,7 @@ def _download_url_image(url: str, token: str, req_module: object) -> bytes:
 
 
 def _image_from_download_response(resp: object, token: str, req_module: object) -> bytes:
-    """Parse a /download response as binary image, JSON-wrapped base64, or URL."""
+    """Разбирает /download как бинарную картинку, JSON с base64 или URL."""
     content = getattr(resp, "content", b"") or b""
     image = _normalize_generated_image_bytes(content)
     if image:
@@ -1294,7 +1336,7 @@ def _download_rt_image_file(
     preferred_service: object,
     req_module: object,
 ) -> tuple[bytes, str]:
-    """Poll RT /download until a real image file is available."""
+    """Опрашивает RT /download, пока реальный файл изображения не станет доступен."""
     services: list[str] = []
     for svc in [service_type, preferred_service, *_rt_image_service_candidates(service_type), *_rt_image_service_candidates(preferred_service)]:
         normalized = _normalize_rt_image_service(svc)
@@ -1341,7 +1383,7 @@ def _download_rt_image_file(
 
 
 def _post_rt_image_job(prompt: str, token: str, service: str, translate: bool, req_module: object) -> tuple[object, str, bytes, str]:
-    """Create an RT image job and return (message id, serviceType, direct image, error)."""
+    """Создаёт RT image job и возвращает message id, serviceType, прямую картинку или ошибку."""
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json; charset=utf-8",
@@ -1401,7 +1443,7 @@ def _post_rt_image_job(prompt: str, token: str, service: str, translate: bool, r
 
 
 def _prepare_image_prompt(prompt: object) -> str:
-    """Keep image prompts compact and safe for RT image endpoints."""
+    """Сжимает image prompt до компактного и безопасного для RT endpoints вида."""
     text = _clean_text(prompt)
     if not text:
         text = "professional realistic 16:9 editorial presentation image, high quality, no text overlay"
@@ -1411,14 +1453,11 @@ def _prepare_image_prompt(prompt: object) -> str:
 
 
 def generate_image_rt(prompt: str, token: str, service: str = "sd") -> Optional[bytes]:
-    """Generate image using RT API (Stable Diffusion or Yandex ART).
+    """Генерирует изображение через RT API (Stable Diffusion или Yandex ART).
 
-    The RT image APIs return a message id first, and the actual binary file must
-    be fetched from /download. In practice /download can temporarily return JSON,
-    an empty body, or use slightly different serviceType values. This function
-    follows the documented flow and applies robust fallbacks so the generated
-    image is actually embedded into preview/PPTX instead of being reported as
-    successfully requested but missing.
+    RT image API сначала возвращает message id, а бинарный файл нужно забрать
+    через /download. На практике /download может временно вернуть JSON, пустое
+    тело или другой serviceType, поэтому здесь есть несколько fallback-попыток.
     """
     _set_image_error("")
     token = (token or "").strip()
@@ -1435,15 +1474,15 @@ def generate_image_rt(prompt: str, token: str, service: str = "sd") -> Optional[
     image_prompt = _prepare_image_prompt(prompt)
     requested_service = _normalize_rt_image_service(service)
     service_order = [requested_service]
-    # Fallback to the other RT image backend when the chosen one returns no file.
+    # Если выбранный backend не вернул файл, пробуем второй RT image backend.
     other_service = "sd" if requested_service == "yaArt" else "yaArt"
     if other_service not in service_order:
         service_order.append(other_service)
 
     errors: list[str] = []
     for svc in service_order:
-        # The attached RT docs use translate=false. If that fails, try true once
-        # to support Russian user instructions in manual slide edits.
+        # В документации используется translate=false; translate=true помогает
+        # с русскими инструкциями при ручном редактировании отдельных слайдов.
         for translate in (False, True):
             msg_id, returned_service, direct_image, post_error = _post_rt_image_job(
                 image_prompt, token, svc, translate, req
@@ -1468,7 +1507,7 @@ def generate_image_rt(prompt: str, token: str, service: str = "sd") -> Optional[
 
 
 def image_bytes_to_base64(data: bytes) -> str:
-    """Return a browser- and PPTX-safe data URL for generated images."""
+    """Возвращает data URL, безопасный для браузера и PPTX."""
     data = _normalize_generated_image_bytes(data)
     if not data:
         return ""
@@ -1477,7 +1516,7 @@ def image_bytes_to_base64(data: bytes) -> str:
 
 
 def _normalize_image_data_url(value: object) -> str:
-    """Accept both old `image/png;base64,...` and normal `data:image/...` formats."""
+    """Принимает старый `image/png;base64,...` и нормальный `data:image/...` формат."""
     if not isinstance(value, str):
         return ""
     text = value.strip()
@@ -1495,7 +1534,7 @@ def _normalize_image_data_url(value: object) -> str:
 
 
 def _decode_image_data(value: object) -> bytes:
-    """Decode slide imageData safely. Returns b'' if data is missing or invalid."""
+    """Безопасно декодирует imageData; при ошибке возвращает пустые байты."""
     text = _normalize_image_data_url(value)
     if not text or text.startswith("http") or text.startswith("/"):
         return b""
@@ -1519,7 +1558,7 @@ def _looks_like_image_request(text: object) -> bool:
 
 
 def _fallback_image_prompt_for_slide(slide: dict, topic: str = "", instruction: str = "") -> str:
-    """Create a usable image prompt when the LLM did not provide image_prompt."""
+    """Создаёт image_prompt, если LLM не вернула его для слайда."""
     title = _clean_text(slide.get("title") or topic or "presentation slide")
     plain = _slide_plain_text(slide)
     source = " ".join(x for x in [instruction, title, plain[:220], topic] if _clean_text(x))
@@ -1531,7 +1570,7 @@ def _fallback_image_prompt_for_slide(slide: dict, topic: str = "", instruction: 
 
 
 def _ensure_slide_image_prompt(slide: dict, topic: str = "", instruction: str = "", force: bool = False) -> bool:
-    """Make sure a slide has image_prompt when image generation was requested."""
+    """Гарантирует наличие image_prompt, когда пользователь запросил генерацию картинок."""
     if not isinstance(slide, dict):
         return False
     if _clean_text(slide.get("image_prompt")):
@@ -1551,7 +1590,7 @@ def _generate_slide_image_if_needed(
     instruction: str = "",
     force: bool = False,
 ) -> tuple[bool, str]:
-    """Generate and attach imageData for one slide only when needed."""
+    """Генерирует и прикрепляет imageData только для одного нужного слайда."""
     if not isinstance(slide, dict):
         return False, "Слайд не является объектом JSON."
     token = (token or "").strip()
@@ -1582,14 +1621,58 @@ def _generate_slide_image_if_needed(
         return False, "Изображение получено, но не удалось подготовить его для PPTX."
     return True, "Изображение сгенерировано и прикреплено к выбранному слайду."
 
-# ── PPTX generation ──────────────────────────────────────────────────────────
+# ── Генерация PPTX ────────────────────────────────────────────────────────────
 
-THEMES = {    "modern":     {"bg": "0F172A", "bg2": "1E3A5F", "title": "F8FAFC", "text": "CBD5E1", "accent": "38BDF8", "accent2": "818CF8"},
-    "rostelecom": {"bg": "0A0F1E", "bg2": "1A0A3E", "title": "FFFFFF", "text": "D0D5DD", "accent": "7700FF", "accent2": "C026D3"},
-    "corporate":  {"bg": "F1F5F9", "bg2": "DBEAFE", "title": "0F172A", "text": "334155", "accent": "2563EB", "accent2": "0EA5E9"},
-    "minimal":    {"bg": "FFFFFF", "bg2": "F1F5F9", "title": "111827", "text": "4B5563", "accent": "6366F1", "accent2": "8B5CF6"},
-    "tech":       {"bg": "071A0E", "bg2": "0D2B18", "title": "ECFDF5", "text": "BBF7D0", "accent": "22C55E", "accent2": "06B6D4"},
-    "creative":   {"bg": "1E0A35", "bg2": "3D0F52", "title": "FFF7ED", "text": "F5D0FE", "accent": "F97316", "accent2": "EC4899"},}
+THEMES = {
+    DEFAULT_STYLE: {
+        "bg": "0A0F1E",
+        "bg2": "1A0A3E",
+        "title": "FFFFFF",
+        "text": "D0D5DD",
+        "accent": "7700FF",
+        "accent2": "C026D3",
+    },
+    "modern": {
+        "bg": "0F172A",
+        "bg2": "1E3A5F",
+        "title": "F8FAFC",
+        "text": "CBD5E1",
+        "accent": "38BDF8",
+        "accent2": "818CF8",
+    },
+    "corporate": {
+        "bg": "F1F5F9",
+        "bg2": "DBEAFE",
+        "title": "0F172A",
+        "text": "334155",
+        "accent": "2563EB",
+        "accent2": "0EA5E9",
+    },
+    "minimal": {
+        "bg": "FFFFFF",
+        "bg2": "F1F5F9",
+        "title": "111827",
+        "text": "4B5563",
+        "accent": "6366F1",
+        "accent2": "8B5CF6",
+    },
+    "tech": {
+        "bg": "071A0E",
+        "bg2": "0D2B18",
+        "title": "ECFDF5",
+        "text": "BBF7D0",
+        "accent": "22C55E",
+        "accent2": "06B6D4",
+    },
+    "creative": {
+        "bg": "1E0A35",
+        "bg2": "3D0F52",
+        "title": "FFF7ED",
+        "text": "F5D0FE",
+        "accent": "F97316",
+        "accent2": "EC4899",
+    },
+}
 
 def _xml_text(value: object) -> str:
     return escape(str(value or ""))
@@ -1684,12 +1767,12 @@ def _slide_xml(slide: dict, index: int, colors: dict) -> str:
 </p:sld>"""
 
 def build_pptx(slide_data: dict, output_path: str, theme: str) -> bool:
-    """Build PPTX with gradient backgrounds, accent shapes, and decorative elements."""
+    """Собирает PPTX с градиентами, акцентными фигурами и изображениями."""
     slides_list = slide_data.get("slides") or []
     if not slides_list:
         return False
 
-    colors = THEMES.get(theme, THEMES["modern"])
+    colors = THEMES.get(normalize_style(theme), THEMES[DEFAULT_STYLE])
 
     try:
         from pptx import Presentation
@@ -1716,7 +1799,7 @@ def build_pptx(slide_data: dict, output_path: str, theme: str) -> bool:
             return RGBColor.from_string(h)
 
         def _grad_bg(slide, c1: str, c2: str) -> None:
-            """Set a top-to-bottom gradient background."""
+            """Ставит градиентный фон через XML, потому что python-pptx не даёт удобного API."""
             slide.background.fill.solid()
             slide.background.fill.fore_color.rgb = rgb(c1)
             bgPr = slide._element.find('.//' + qn('p:bgPr'))
@@ -1735,7 +1818,7 @@ def build_pptx(slide_data: dict, output_path: str, theme: str) -> bool:
             ))
 
         def _shape(sl, sid: int, x, y, w, h, clr: str, alpha: int = 100):
-            """Add a filled shape. alpha 0-100: 100=opaque."""
+            """Добавляет фигуру с прозрачностью; alpha 100 означает полностью непрозрачно."""
             sh = sl.shapes.add_shape(sid, Inches(x), Inches(y), Inches(w), Inches(h))
             sh.line.fill.background()
             sh.fill.solid()
@@ -1784,7 +1867,7 @@ def build_pptx(slide_data: dict, output_path: str, theme: str) -> bool:
             return max(min_sz, int(base - penalty))
 
         def decor(sl):
-            """Decorative semi-transparent circles in corners."""
+            """Добавляет полупрозрачные декоративные круги по углам."""
             oval(sl,  9.5, -1.5, 6.5, 6.5, ac_c,  a=10)
             oval(sl, -2.0,  5.0, 5.5, 5.5, ac2_c, a=7)
 
@@ -1792,7 +1875,7 @@ def build_pptx(slide_data: dict, output_path: str, theme: str) -> bool:
             txt(sl, 12.1, 7.05, 1.1, 0.3, str(n), sz=11, bold=True, clr=ac_c, align='right')
 
         def add_slide_image(sl, item, x, y, w, h, panel=True):
-            """Add slide imageData to PPTX and keep aspect ratio. Returns True on success."""
+            """Встраивает imageData в PPTX с сохранением пропорций."""
             blob = _decode_image_data(item.get('imageData'))
             if not blob:
                 return False
@@ -1900,7 +1983,7 @@ def build_pptx(slide_data: dict, output_path: str, theme: str) -> bool:
                 if content:
                     txt(sl, 0.9, 3.15, 12.0, 3.0, content, sz=fit_sz(content, 22, 15, 420, 7), clr=tx_c)
 
-            else:  # content
+            else:  # Обычный контентный слайд со списком тезисов.
                 rect(sl, 0, 0, 0.23, 7.5, ac_c)
                 txt(sl, 0.5, 0.28, 12.5, 1.0, title, sz=fit_sz(title, 32, 24, 90, 2), bold=True, clr=ti_c)
                 rect(sl, 0.5, 1.3, 4.8, 0.06, ac_c, a=65)
@@ -1913,7 +1996,7 @@ def build_pptx(slide_data: dict, output_path: str, theme: str) -> bool:
                     bullet_text, sz=fit_sz(bullet_text, 20, 14, 520 if not has_img else 360, 8), clr=tx_c)
 
             if item.get('imageData') and not image_placed:
-                # Fallback placement for title/two_column/stats/quote/conclusion layouts.
+                # Запасное место для картинок в title/two_column/stats/quote/conclusion layout.
                 image_placed = add_slide_image(sl, item, 9.0, 5.05, 3.7, 1.75, panel=True)
 
             slide_num(sl, idx)
@@ -1970,6 +2053,8 @@ def create_presentation_from_data(
     document_filename: str = "",
     document_content: bytes = b"",
 ) -> dict:
+    """Полный pipeline генерации: документ -> структура -> QA -> картинки -> PPTX."""
+    style = normalize_style(style)
     session_id = str(uuid.uuid4())
     output_path = str(WORK_DIR / f"{session_id}.pptx")
 
@@ -1981,6 +2066,7 @@ def create_presentation_from_data(
         structure, prompt, doc_text, slide_count, style, tone, rt_token
     )
     structure["_presentai_context"] = {
+        # Этот блок сохраняется в JSON, чтобы результат можно было редактировать позже.
         "prompt": prompt,
         "style": style,
         "tone": tone,
@@ -1990,6 +2076,7 @@ def create_presentation_from_data(
         "rt_service": rt_service,
     }
     SESSION_SECRETS[session_id] = {
+        # RT-токен нужен для точечного редактирования, но не должен попадать на диск.
         "rt_token": rt_token.strip(),
         "prompt": prompt,
         "style": style,
@@ -2004,8 +2091,8 @@ def create_presentation_from_data(
     image_warnings: list[str] = []
     if generate_images and rt_token.strip():
         for idx, slide in enumerate(slides, start=1):
-            # Some LLM answers omit image_prompt even when the user enabled images.
-            # Create a deterministic fallback prompt so image generation really runs.
+            # Некоторые LLM-ответы не содержат image_prompt даже при включённых картинках.
+            # Создаём запасной prompt, чтобы генерация действительно запускалась.
             _ensure_slide_image_prompt(slide, prompt)
             if slide.get("image_prompt"):
                 ok, message = _generate_slide_image_if_needed(
@@ -2074,7 +2161,7 @@ def render_result_page(data: dict) -> str:
     warning_json = json.dumps(warning, ensure_ascii=False).replace("</", "<\\/")
     source = data.get("source", "") or "неизвестен"
     review_source = data.get("review_source", "") or "QA-контроль"
-    style = data.get("style", "rostelecom") or "rostelecom"
+    style = normalize_style(data.get("style", DEFAULT_STYLE))
 
     html = """<!doctype html>
 <html lang="ru">
@@ -2480,13 +2567,13 @@ run();
 </script>
 </body></html>"""
 
-# ── API Routes ────────────────────────────────────────────────────────────────
+# ── API-маршруты ──────────────────────────────────────────────────────────────
 
 @app.post("/api/generate")
 async def generate_presentation(
     prompt: str = Form(...),
     slide_count: int = Form(8),
-    style: str = Form("modern"),
+    style: str = Form(DEFAULT_STYLE),
     tone: str = Form("professional"),
     generate_images: bool = Form(False),
     rt_token: str = Form(""),
@@ -2509,7 +2596,7 @@ async def generate_presentation(
 async def create_loading_job(
     prompt: str = Form(...),
     slide_count: int = Form(8),
-    style: str = Form("rostelecom"),
+    style: str = Form(DEFAULT_STYLE),
     tone: str = Form("professional"),
     generate_images: bool = Form(False),
     rt_token: str = Form(""),
@@ -2565,7 +2652,7 @@ async def run_loading_job(job_id: str):
 async def generate_presentation_page(
     prompt: str = Form(...),
     slide_count: int = Form(8),
-    style: str = Form("rostelecom"),
+    style: str = Form(DEFAULT_STYLE),
     tone: str = Form("professional"),
     generate_images: bool = Form(False),
     rt_token: str = Form(""),
@@ -2584,6 +2671,7 @@ async def generate_presentation_page(
 
 @app.post("/api/rebuild/{session_id}")
 async def rebuild_pptx(session_id: str, request: Request):
+    """Пересобирает PPTX из отредактированных в браузере слайдов."""
     try:
         payload = await request.json()
         slides = payload.get("slides")
@@ -2594,7 +2682,7 @@ async def rebuild_pptx(session_id: str, request: Request):
             existing = {}
 
         context = _session_context(existing, session_id) if existing else {}
-        style = payload.get("style") or context.get("style") or "modern"
+        style = normalize_style(payload.get("style") or context.get("style") or DEFAULT_STYLE)
         title = payload.get("title") or existing.get("presentation_title") or "Презентация"
         if not isinstance(slides, list) or not slides:
             raise HTTPException(400, "Нет данных слайдов для пересборки")
@@ -2604,6 +2692,7 @@ async def rebuild_pptx(session_id: str, request: Request):
         for idx, slide in enumerate(slides):
             merged = copy.deepcopy(slide)
             if idx < len(old_slides):
+                # Ручное редактирование текста не должно стирать уже вложенные картинки.
                 old = old_slides[idx]
                 if old.get("imageData") and not merged.get("imageData"):
                     merged["imageData"] = old.get("imageData")
@@ -2660,12 +2749,13 @@ async def get_session(session_id: str):
         "warning": " ".join(x for x in [structure.get("generation_warning", ""), structure.get("review_warning", ""), structure.get("image_generation_warning", "")] if x).strip(),
         "review_source": structure.get("review_source", ""),
         "quality_review": structure.get("quality_review", {}),
-        "style": context.get("style", "modern"),
+        "style": normalize_style(context.get("style", DEFAULT_STYLE)),
     })
 
 
 @app.post("/api/session/{session_id}/slide/{slide_index}/edit")
 async def edit_session_slide(session_id: str, slide_index: int, request: Request):
+    """Редактирует один выбранный слайд и не регенерирует всю презентацию."""
     try:
         payload = await request.json()
         structure = load_session_structure(session_id)
@@ -2677,7 +2767,7 @@ async def edit_session_slide(session_id: str, slide_index: int, request: Request
             raise HTTPException(404, "Слайд не найден")
 
         context = _session_context(structure, session_id)
-        style = payload.get("style") or context.get("style") or "modern"
+        style = normalize_style(payload.get("style") or context.get("style") or DEFAULT_STYLE)
         doc_text = context.get("document_excerpt", "")
         topic = context.get("prompt", "") or structure.get("presentation_title", "")
         rt_service = payload.get("rt_service") or context.get("rt_service") or "sd"
@@ -2687,7 +2777,7 @@ async def edit_session_slide(session_id: str, slide_index: int, request: Request
         before_image_prompt = _clean_text(slides[idx].get("image_prompt"))
         before_had_image = bool(slides[idx].get("imageData"))
 
-        # First apply manual fields from the editor to the selected slide only.
+        # Сначала применяем ручные поля из редактора только к выбранному слайду.
         slides[idx] = _slide_from_editor_payload(slides[idx], payload, idx, len(slides))
         structure["slides"] = slides
 
@@ -2702,9 +2792,8 @@ async def edit_session_slide(session_id: str, slide_index: int, request: Request
                 structure, idx, "", "", doc_text
             )
 
-        # If the point-edit asks for an image, the LLM can only update image_prompt.
-        # The actual picture must be generated for this selected slide and embedded
-        # before the PPTX is rebuilt. This does not regenerate the whole presentation.
+        # Если точечная правка просит картинку, LLM обновляет только image_prompt.
+        # Сам файл изображения генерируется отдельно и только для выбранного слайда.
         edited_slides = structure.get("slides", []) or []
         if idx < len(edited_slides):
             selected_slide = edited_slides[idx]
@@ -2735,7 +2824,7 @@ async def edit_session_slide(session_id: str, slide_index: int, request: Request
                 edited_slides[idx] = selected_slide
                 structure["slides"] = edited_slides
 
-        # Update QA metadata without touching other slides.
+        # Обновляем QA-метаданные, не трогая замечания по остальным слайдам.
         old_review = structure.get("quality_review") if isinstance(structure.get("quality_review"), dict) else {}
         old_issues = [x for x in (old_review.get("issues") or []) if not (isinstance(x, dict) and x.get("slide") == slide_index)]
         slide_issues = []
@@ -2782,18 +2871,18 @@ async def edit_session_slide(session_id: str, slide_index: int, request: Request
 
 @app.get("/api/demo")
 async def demo_pptx():
-    """Generate and download a demo PPTX without JavaScript or API tokens."""
+    """Генерирует и скачивает демо-PPTX без JavaScript и API-ключей."""
     session_id = str(uuid.uuid4())
     output_path = str(WORK_DIR / f"{session_id}.pptx")
     structure = generate_slide_structure(
-        "Демо-презентация: AI-генератор презентаций для Ростелекома",
+        "Демо-презентация: AI-генератор презентаций",
         "Проверка локальной генерации без API-ключей. Сервис принимает промпт, документ PDF или DOCX, настройки стиля и тона, затем собирает PPTX.",
         6,
-        "rostelecom",
+        DEFAULT_STYLE,
         "professional",
         "",
     )
-    if not build_pptx(structure, output_path, "rostelecom"):
+    if not build_pptx(structure, output_path, DEFAULT_STYLE):
         raise HTTPException(500, "Ошибка генерации demo PPTX")
     return FileResponse(
         output_path,
@@ -2836,7 +2925,7 @@ async def result_page(session_id: str):
         "source": structure.get("generation_source", ""),
         "review_source": structure.get("review_source", ""),
         "quality_review": structure.get("quality_review", {}),
-        "style": context.get("style", "rostelecom"),
+        "style": normalize_style(context.get("style", DEFAULT_STYLE)),
     })
 
 
@@ -2844,7 +2933,7 @@ async def result_page(session_id: str):
 async def frontend():
     return HTML_TEMPLATE
 
-# ── Frontend ──────────────────────────────────────────────────────────────────
+# ── Веб-интерфейс ─────────────────────────────────────────────────────────────
 
 HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="ru">
@@ -3606,42 +3695,45 @@ footer strong { color: var(--accent-a); }
       <label>Визуальная тема</label>
       <div class="theme-grid">
         <div class="theme-card">
-          <input type="radio" name="style" id="s-rostelecom" value="rostelecom" checked>
-          <label for="s-rostelecom">
+          <input type="radio" name="style" id="s-deep-neon" value="deep_neon" checked>
+          <label for="s-deep-neon">
             <div class="theme-preview" style="background:linear-gradient(160deg,#0A0F1E 0%,#1A0A3E 100%);border-top:4px solid #7700FF"></div>
-            <div class="theme-card-info"><div class="theme-card-name">Ростелеком</div><div class="theme-card-desc">Тёмный · фиолетовый акцент</div></div>
+            <div class="theme-card-info"><div class="theme-card-name">Глубокий неон</div><div class="theme-card-desc">Тёмный · фиолетовый акцент</div></div>
           </label>
         </div>
         <div class="theme-card">
           <input type="radio" name="style" id="s-modern" value="modern">
           <label for="s-modern">
             <div class="theme-preview" style="background:linear-gradient(160deg,#0F172A 0%,#1E3A5F 100%);border-top:4px solid #38BDF8"></div>
-            <div class="theme-card-info"><div class="theme-card-name">Modern Dark</div><div class="theme-card-desc">Тёмный · голубой акцент</div></div>
+            <div class="theme-card-info"><div class="theme-card-name">Тёмная волна</div><div class="theme-card-desc">Тёмный · голубой акцент</div></div>
           </label>
         </div>
         <div class="theme-card">
           <input type="radio" name="style" id="s-corporate" value="corporate">
           <label for="s-corporate">
             <div class="theme-preview" style="background:linear-gradient(160deg,#F1F5F9 0%,#DBEAFE 100%);border-top:4px solid #2563EB"></div>
-            <div class="theme-card-info"><div class="theme-card-name">Corporate</div><div class="theme-card-desc">Светлый · синий акцент</div></div>
+            <div class="theme-card-info"><div class="theme-card-name">Деловая</div><div class="theme-card-desc">Светлый · синий акцент</div></div>
           </label>
         </div>
         <div class="theme-card">
           <input type="radio" name="style" id="s-tech" value="tech">
           <label for="s-tech">
             <div class="theme-preview" style="background:linear-gradient(160deg,#071A0E 0%,#0D2B18 100%);border-top:4px solid #22C55E"></div>
-            <div class="theme-card-info"><div class="theme-card-name">Tech</div><div class="theme-card-desc">Тёмный · зелёный акцент</div></div>
+            <div class="theme-card-info"><div class="theme-card-name">Технологичная</div><div class="theme-card-desc">Тёмный · зелёный акцент</div></div>
           </label>
         </div>
-        <div class="option-item">
-          <input type="radio" name="style-radio" id="s-minimal" value="minimal" onchange="document.getElementById('style').value=this.value">
-          <label for="s-minimal"><span class="emoji">⬜</span>Minimal</label>
+        <div class="theme-card">
+          <input type="radio" name="style" id="s-minimal" value="minimal">
+          <label for="s-minimal">
+            <div class="theme-preview" style="background:linear-gradient(160deg,#FFFFFF 0%,#F1F5F9 100%);border-top:4px solid #6366F1"></div>
+            <div class="theme-card-info"><div class="theme-card-name">Минимализм</div><div class="theme-card-desc">Светлый · чистый акцент</div></div>
+          </label>
         </div>
         <div class="theme-card">
           <input type="radio" name="style" id="s-creative" value="creative">
           <label for="s-creative">
             <div class="theme-preview" style="background:linear-gradient(160deg,#1E0A35 0%,#3D0F52 100%);border-top:4px solid #F97316"></div>
-            <div class="theme-card-info"><div class="theme-card-name">Creative</div><div class="theme-card-desc">Тёмный · оранжевый акцент</div></div>
+            <div class="theme-card-info"><div class="theme-card-name">Креативная</div><div class="theme-card-desc">Тёмный · оранжевый акцент</div></div>
           </label>
         </div>
       </div>
@@ -3746,7 +3838,7 @@ footer strong { color: var(--accent-a); }
 <script>
 let sessionId = null;
 let currentSlides = [];
-let currentStyle = 'rostelecom';
+let currentStyle = 'deep_neon';
 
 window.addEventListener('error', event => {
   const message = event.message || 'Неизвестная ошибка JavaScript';
@@ -3771,7 +3863,7 @@ function handleFileSelect(input) {
   }
 }
 
-// Drag-drop
+// Перетаскивание документа поверх стандартного input[type=file].
 const zone = document.getElementById('upload-zone');
 zone.addEventListener('dragover', e => { e.preventDefault(); zone.classList.add('dragover'); });
 zone.addEventListener('dragleave', () => zone.classList.remove('dragover'));
@@ -3791,7 +3883,7 @@ function toggleImages() {
 }
 
 function setStep(n) {
-  // The old visual stepper was replaced by functional capability cards.
+  // Старый визуальный stepper заменён карточками возможностей; функция оставлена для совместимости.
 }
 
 function setProgress(pct, emoji, title, sub) {
@@ -3886,7 +3978,7 @@ async function generate() {
     const rtToken = document.getElementById('rt-token').value.trim();
     const rtService = document.getElementById('rt-service').value;
     const slideCount = document.getElementById('slide-count').value;
-    const style = document.querySelector('input[name="style"]:checked')?.value || 'rostelecom';
+    const style = document.querySelector('input[name="style"]:checked')?.value || 'deep_neon';
     const tone  = document.querySelector('input[name="tone"]:checked')?.value  || 'professional';
     currentStyle = style;
 
@@ -4169,17 +4261,17 @@ function resetForm() {
   document.getElementById('gen-btn').disabled = false;
   document.getElementById('gen-btn').innerHTML = '<span>✦</span> Сгенерировать презентацию';
   setStep(1);
-  // Reset progress steps
+  // Сбрасываем состояние прогресса перед новой генерацией.
   ['ps1','ps2','ps3','ps4'].forEach(id => document.getElementById(id).classList.remove('done'));
   document.getElementById('progress-bar').style.width = '0%';
   document.getElementById('progress-percent').textContent = '0%';
 }
 
-// Sync currentStyle with theme radio selection
+// Держим currentStyle синхронным с выбранной визуальной темой.
 document.querySelectorAll('input[name="style"]').forEach(r => {
   r.addEventListener('change', () => { currentStyle = r.value; });
 });
-currentStyle = document.querySelector('input[name="style"]:checked')?.value || 'rostelecom';
+currentStyle = document.querySelector('input[name="style"]:checked')?.value || 'deep_neon';
 
 document.getElementById('generator-form').addEventListener('submit', function(event) {
   const prompt = document.getElementById('prompt').value.trim();
@@ -4196,7 +4288,7 @@ bindSlideCountControls();
 </html>
 """
 
-# ── Entry point ───────────────────────────────────────────────────────────────
+# ── Точка входа ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
