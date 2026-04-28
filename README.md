@@ -24,12 +24,26 @@
 
 ```powershell
 cd путь\к\папке\hackathon
-py -3 -m venv .venv
+py -3 -m venv .venv --upgrade-deps
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 .\.venv\Scripts\python.exe iigenerator\app.py
 ```
 
 Если PowerShell не разрешает запускать скрипты виртуального окружения, используйте команды выше именно через `.\.venv\Scripts\python.exe` - активация окружения не требуется.
+
+На Windows не используйте Linux-команду `.venv/bin/python`. Для PowerShell правильный путь к Python внутри окружения: `.\.venv\Scripts\python.exe`.
+
+Если появляется ошибка `No module named pip.main` или `cannot import name 'FastAPI' from 'fastapi'`, пересоздайте окружение:
+
+```powershell
+cd C:\Users\f4ddlaptop\Documents\GitHub\hackathon
+Remove-Item -Recurse -Force .venv
+py -3 -m venv .venv --upgrade-deps
+.\.venv\Scripts\python.exe -m ensurepip --upgrade
+.\.venv\Scripts\python.exe -m pip install --upgrade pip setuptools wheel
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe iigenerator\app.py
+```
 
 ### Linux
 
