@@ -387,14 +387,12 @@ def image_bytes_to_base64(data: bytes) -> str:
 
 # ── PPTX generation ──────────────────────────────────────────────────────────
 
-THEMES = {
-    "modern": {"bg": "0F172A", "title": "F8FAFC", "text": "CBD5E1", "accent": "38BDF8"},
-    "rostelecom": {"bg": "101828", "title": "FFFFFF", "text": "D0D5DD", "accent": "7700FF"},
-    "corporate": {"bg": "FFFFFF", "title": "0F172A", "text": "334155", "accent": "2563EB"},
-    "creative": {"bg": "2A0F2F", "title": "FFF7ED", "text": "F5D0FE", "accent": "F97316"},
-    "minimal": {"bg": "FAFAFA", "title": "111827", "text": "374151", "accent": "111827"},
-    "tech": {"bg": "07130D", "title": "ECFDF5", "text": "BBF7D0", "accent": "22C55E"},
-}
+THEMES = {    "modern":     {"bg": "0F172A", "bg2": "1E3A5F", "title": "F8FAFC", "text": "CBD5E1", "accent": "38BDF8", "accent2": "818CF8"},
+    "rostelecom": {"bg": "0A0F1E", "bg2": "1A0A3E", "title": "FFFFFF", "text": "D0D5DD", "accent": "7700FF", "accent2": "C026D3"},
+    "corporate":  {"bg": "F1F5F9", "bg2": "DBEAFE", "title": "0F172A", "text": "334155", "accent": "2563EB", "accent2": "0EA5E9"},
+    "minimal":    {"bg": "FFFFFF", "bg2": "F1F5F9", "title": "111827", "text": "4B5563", "accent": "6366F1", "accent2": "8B5CF6"},
+    "tech":       {"bg": "071A0E", "bg2": "0D2B18", "title": "ECFDF5", "text": "BBF7D0", "accent": "22C55E", "accent2": "06B6D4"},
+    "creative":   {"bg": "1E0A35", "bg2": "3D0F52", "title": "FFF7ED", "text": "F5D0FE", "accent": "F97316", "accent2": "EC4899"},}
 
 def _xml_text(value: object) -> str:
     return escape(str(value or ""))
@@ -489,9 +487,9 @@ def _slide_xml(slide: dict, index: int, colors: dict) -> str:
 </p:sld>"""
 
 def build_pptx(slide_data: dict, output_path: str, theme: str) -> bool:
-    """Build PPTX with python-pptx and embed generated images when present."""
-    slides = slide_data.get("slides") or []
-    if not slides:
+    """Build PPTX with gradient backgrounds, accent shapes, and decorative elements."""
+    slides_list = slide_data.get("slides") or []
+    if not slides_list:
         return False
 
     colors = THEMES.get(theme, THEMES["modern"])
@@ -499,81 +497,195 @@ def build_pptx(slide_data: dict, output_path: str, theme: str) -> bool:
     try:
         from pptx import Presentation
         from pptx.dml.color import RGBColor
-        from pptx.enum.text import PP_ALIGN
         from pptx.util import Inches, Pt
+        from pptx.enum.text import PP_ALIGN
+        from pptx.oxml.ns import qn
+        from lxml import etree
 
         prs = Presentation()
         prs.slide_width = Inches(13.333)
         prs.slide_height = Inches(7.5)
         blank = prs.slide_layouts[6]
 
-        def rgb(hex_color: str) -> RGBColor:
-            return RGBColor.from_string(hex_color)
+        bg_c  = colors["bg"]
+        bg2_c = colors.get("bg2", bg_c)
+        ti_c  = colors["title"]
+        tx_c  = colors["text"]
+        ac_c  = colors["accent"]
+        ac2_c = colors.get("accent2", ac_c)
+        NS_A  = "http://schemas.openxmlformats.org/drawingml/2006/main"
 
-        def add_textbox(slide_obj, x, y, w, h, text, size=24, bold=False, color=None):
-            box = slide_obj.shapes.add_textbox(Inches(x), Inches(y), Inches(w), Inches(h))
+        def rgb(h: str) -> RGBColor:
+            return RGBColor.from_string(h)
+
+        def _grad_bg(slide, c1: str, c2: str) -> None:
+            """Set a top-to-bottom gradient background."""
+            slide.background.fill.solid()
+            slide.background.fill.fore_color.rgb = rgb(c1)
+            bgPr = slide._element.find('.//' + qn('p:bgPr'))
+            if bgPr is None:
+                return
+            for ch in list(bgPr):
+                bgPr.remove(ch)
+            bgPr.append(etree.fromstring(
+                f'<a:gradFill xmlns:a="{NS_A}" rotWithShape="1">'
+                f'<a:gsLst>'
+                f'<a:gs pos="0"><a:srgbClr val="{c1}"/></a:gs>'
+                f'<a:gs pos="100000"><a:srgbClr val="{c2}"/></a:gs>'
+                f'</a:gsLst>'
+                f'<a:lin ang="16200000" scaled="0"/>'
+                f'</a:gradFill>'
+            ))
+
+        def _shape(sl, sid: int, x, y, w, h, clr: str, alpha: int = 100):
+            """Add a filled shape. alpha 0-100: 100=opaque."""
+            sh = sl.shapes.add_shape(sid, Inches(x), Inches(y), Inches(w), Inches(h))
+            sh.line.fill.background()
+            sh.fill.solid()
+            sh.fill.fore_color.rgb = rgb(clr)
+            if alpha < 100:
+                sp = sh._element.find(qn('p:spPr'))
+                sf = sp.find('.//' + qn('a:solidFill'))
+                if sf is not None:
+                    sc = sf.find(qn('a:srgbClr'))
+                    if sc is not None:
+                        ae = etree.SubElement(sc, qn('a:alpha'))
+                        ae.set('val', str(alpha * 1000))
+            return sh
+
+        def rect(sl, x, y, w, h, clr, a=100):
+            return _shape(sl, 1, x, y, w, h, clr, a)
+
+        def oval(sl, x, y, w, h, clr, a=15):
+            return _shape(sl, 9, x, y, w, h, clr, a)
+
+        def txt(sl, x, y, w, h, text, sz=22, bold=False, clr=None,
+                align='left', wrap=True, italic=False):
+            amap = {'left': PP_ALIGN.LEFT, 'center': PP_ALIGN.CENTER, 'right': PP_ALIGN.RIGHT}
+            box = sl.shapes.add_textbox(Inches(x), Inches(y), Inches(w), Inches(h))
             tf = box.text_frame
             tf.clear()
-            tf.word_wrap = True
-            for idx, line in enumerate(str(text or "").split("\n") or [""]):
-                p = tf.paragraphs[0] if idx == 0 else tf.add_paragraph()
-                p.text = line
-                p.font.size = Pt(size)
+            tf.word_wrap = wrap
+            lines = text.split('\n') if isinstance(text, str) else list(text or [''])
+            for i, ln in enumerate(lines or ['']):
+                p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
+                p.text = str(ln)
+                p.alignment = amap.get(align, PP_ALIGN.LEFT)
+                p.font.size = Pt(sz)
                 p.font.bold = bold
-                p.font.name = "Arial"
-                p.font.color.rgb = rgb(color or colors["text"])
+                p.font.italic = italic
+                p.font.name = 'Arial'
+                p.font.color.rgb = rgb(clr or tx_c)
             return box
 
-        for index, item in enumerate(slides, start=1):
-            slide = prs.slides.add_slide(blank)
-            bg = slide.background.fill
-            bg.solid()
-            bg.fore_color.rgb = rgb(colors["bg"])
+        def decor(sl):
+            """Decorative semi-transparent circles in corners."""
+            oval(sl,  9.5, -1.5, 6.5, 6.5, ac_c,  a=10)
+            oval(sl, -2.0,  5.0, 5.5, 5.5, ac2_c, a=7)
 
-            title = item.get("title") or f"Слайд {index}"
-            add_textbox(slide, 0.55, 0.35, 7.4, 1.0, title, size=30 if index > 1 else 38, bold=True, color=colors["title"])
+        def slide_num(sl, n):
+            txt(sl, 12.1, 7.05, 1.1, 0.3, str(n), sz=11, bold=True, clr=ac_c, align='right')
 
-            image_data = item.get("imageData")
-            has_image = False
-            if image_data:
-                try:
-                    raw = image_data.split(",", 1)[1] if "," in image_data else image_data
-                    stream = io.BytesIO(base64.b64decode(raw))
-                    slide.shapes.add_picture(stream, Inches(8.15), Inches(1.25), width=Inches(4.55), height=Inches(3.25))
-                    has_image = True
-                except Exception as e:
-                    print(f"Image embed failed: {e}")
+        for idx, item in enumerate(slides_list, start=1):
+            sl = prs.slides.add_slide(blank)
+            layout = item.get('layout', 'content')
+            title  = item.get('title') or f'Слайд {idx}'
 
-            body_width = 7.2 if has_image else 11.8
-            layout = item.get("layout", "content")
-            if layout == "title":
-                add_textbox(slide, 0.7, 2.35, 11.5, 1.4, item.get("subtitle", ""), size=24, color=colors["text"])
-            elif layout == "two_column":
-                add_textbox(slide, 0.75, 1.55, 5.4, 0.45, item.get("leftTitle", "Слева"), size=20, bold=True, color=colors["accent"])
-                add_textbox(slide, 6.7, 1.55, 5.4, 0.45, item.get("rightTitle", "Справа"), size=20, bold=True, color=colors["accent"])
-                add_textbox(slide, 0.85, 2.2, 5.2, 3.9, "\n".join(f"• {x}" for x in item.get("leftContent", [])), size=18)
-                add_textbox(slide, 6.8, 2.2, 5.2, 3.9, "\n".join(f"• {x}" for x in item.get("rightContent", [])), size=18)
-            elif layout == "stats":
-                stats = item.get("stats", [])[:3]
-                for pos, stat in enumerate(stats):
-                    x = 0.75 + pos * 3.9
-                    add_textbox(slide, x, 1.55, 3.2, 0.7, stat.get("value", ""), size=30, bold=True, color=colors["accent"])
-                    add_textbox(slide, x, 2.25, 3.2, 0.7, stat.get("label", ""), size=15)
-                add_textbox(slide, 0.75, 3.45, body_width, 2.1, item.get("content", ""), size=20)
-            elif layout == "quote":
-                add_textbox(slide, 0.95, 2.0, body_width, 2.2, item.get("quote", ""), size=26, color=colors["title"])
-            elif layout == "conclusion":
-                add_textbox(slide, 0.75, 2.0, body_width, 2.4, item.get("content", item.get("subtitle", "")), size=24)
-            else:
-                bullets = item.get("bullets") or [item.get("content", "")]
-                add_textbox(slide, 0.75, 1.65, body_width, 4.5, "\n".join(f"• {x}" for x in bullets if x), size=19)
+            _grad_bg(sl, bg_c, bg2_c)
+            decor(sl)
 
-            add_textbox(slide, 0.6, 6.85, 1.0, 0.3, str(index), size=12, bold=True, color=colors["accent"])
+            if layout == 'title':
+                rect(sl, 0, 6.7, 13.333, 0.8, ac_c,  a=85)
+                rect(sl, 0, 6.7, 13.333, 0.8, ac2_c, a=25)
+                rect(sl, 0, 0, 0.3, 6.7, ac_c, a=90)
+                rect(sl, 0.55, 1.6, 12.3, 3.9, ac_c, a=6)
+                txt(sl, 0.9, 1.85, 11.5, 2.1, title, sz=46, bold=True, clr=ti_c)
+                rect(sl, 0.9, 4.0, 3.8, 0.07, ac_c)
+                sub = item.get('subtitle', '')
+                if sub:
+                    txt(sl, 0.9, 4.25, 11.0, 1.3, sub, sz=23, clr=tx_c)
+
+            elif layout == 'two_column':
+                rect(sl, 0, 0, 13.333, 0.13, ac_c)
+                txt(sl, 0.5, 0.28, 12.3, 0.85, title, sz=28, bold=True, clr=ti_c)
+                rect(sl, 0.45, 1.4, 5.9, 5.75, ac_c,  a=10)
+                rect(sl, 0.45, 1.4, 5.9, 0.14, ac_c,  a=90)
+                txt(sl, 0.65, 1.65, 5.5, 0.55, item.get('leftTitle', ''), sz=18, bold=True, clr=ac_c)
+                txt(sl, 0.65, 2.3,  5.5, 4.6,
+                    '\n'.join(f'• {x}' for x in item.get('leftContent', [])), sz=17, clr=tx_c)
+                rect(sl, 6.5,  1.4, 0.07, 5.75, ac_c,  a=22)
+                rect(sl, 6.72, 1.4, 6.1,  5.75, ac2_c, a=10)
+                rect(sl, 6.72, 1.4, 6.1,  0.14, ac2_c, a=90)
+                txt(sl, 6.92, 1.65, 5.7, 0.55, item.get('rightTitle', ''), sz=18, bold=True, clr=ac2_c)
+                txt(sl, 6.92, 2.3,  5.7, 4.6,
+                    '\n'.join(f'• {x}' for x in item.get('rightContent', [])), sz=17, clr=tx_c)
+
+            elif layout == 'stats':
+                rect(sl, 0, 0, 13.333, 0.13, ac_c)
+                txt(sl, 0.5, 0.28, 12.3, 0.85, title, sz=28, bold=True, clr=ti_c)
+                stats = item.get('stats', [])[:3]
+                n_st = len(stats)
+                bw = (12.4 - (n_st - 1) * 0.4) / max(n_st, 1) if n_st else 12.4
+                for i, stat in enumerate(stats):
+                    sx = 0.45 + i * (bw + 0.4)
+                    rect(sl, sx, 1.4, bw, 2.65, ac_c, a=12)
+                    rect(sl, sx, 1.4, bw, 0.14, ac_c if i % 2 == 0 else ac2_c)
+                    txt(sl, sx + 0.1, 1.65, bw - 0.2, 1.3,
+                        stat.get('value', ''), sz=36, bold=True,
+                        clr=ac_c if i % 2 == 0 else ac2_c, align='center')
+                    txt(sl, sx + 0.1, 2.95, bw - 0.2, 0.7,
+                        stat.get('label', ''), sz=15, clr=tx_c, align='center')
+                if item.get('content'):
+                    txt(sl, 0.5, 4.3, 12.3, 2.5, item['content'], sz=19, clr=tx_c)
+
+            elif layout == 'quote':
+                txt(sl, 0.55, 0.4, 2.5, 2.5, '❝', sz=110, clr=ac_c)
+                txt(sl, 1.5, 2.2, 10.6, 3.2, item.get('quote', ''),
+                    sz=26, clr=ti_c, italic=True)
+                rect(sl, 1.5, 5.6, 3.5, 0.07, ac_c)
+                if title and title != f'Слайд {idx}':
+                    txt(sl, 1.5, 5.85, 8.5, 0.6, f'— {title}', sz=15, clr=tx_c)
+
+            elif layout == 'conclusion':
+                rect(sl, 0, 6.7, 13.333, 0.8, ac2_c, a=85)
+                rect(sl, 0, 6.7, 13.333, 0.8, ac_c,  a=25)
+                rect(sl, 0, 0, 0.3, 6.7, ac2_c, a=90)
+                rect(sl, 0.55, 1.2, 12.3, 4.5, ac2_c, a=6)
+                txt(sl, 0.9, 1.45, 12.0, 1.4, title, sz=40, bold=True, clr=ti_c)
+                rect(sl, 0.9, 2.9, 3.5, 0.07, ac2_c)
+                content = item.get('content', item.get('subtitle', ''))
+                if content:
+                    txt(sl, 0.9, 3.15, 12.0, 3.0, content, sz=22, clr=tx_c)
+
+            else:  # content
+                rect(sl, 0, 0, 0.23, 7.5, ac_c)
+                txt(sl, 0.5, 0.28, 12.5, 1.0, title, sz=32, bold=True, clr=ti_c)
+                rect(sl, 0.5, 1.3, 4.8, 0.06, ac_c, a=65)
+                image_data = item.get('imageData')
+                has_img = False
+                if image_data:
+                    try:
+                        raw = image_data.split(',', 1)[1] if ',' in image_data else image_data
+                        stream = io.BytesIO(base64.b64decode(raw))
+                        sl.shapes.add_picture(
+                            stream, Inches(8.3), Inches(1.5),
+                            width=Inches(4.7), height=Inches(3.5)
+                        )
+                        has_img = True
+                    except Exception as e:
+                        print(f'Image embed: {e}')
+                bw = 7.5 if has_img else 12.6
+                bullets = item.get('bullets') or [item.get('content', '')]
+                txt(sl, 0.5, 1.55, bw, 5.5,
+                    '\n'.join(f'• {b}' for b in bullets if b), sz=20, clr=tx_c)
+
+            slide_num(sl, idx)
 
         prs.save(output_path)
         return True
     except Exception as e:
-        print(f"PPTX generation failed: {e}")
+        print(f'PPTX generation failed: {e}')
+        traceback.print_exc()
         return False
 
 def build_preview(slides: list[dict]) -> list[dict]:
@@ -1296,6 +1408,51 @@ input[type="range"]::-moz-range-thumb {
 }
 .toggle-label { font-size: 14px; color: var(--text); font-weight: 700; }
 
+/* ── Tone cards ─────────────────────────────────────── */
+.tone-grid {
+  display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px;
+}
+@media (max-width: 640px) { .tone-grid { grid-template-columns: repeat(3, 1fr); } }
+.tone-card input { display: none; }
+.tone-card label {
+  display: flex; flex-direction: column; align-items: center; gap: 4px;
+  padding: 12px 6px; border-radius: 12px; border: 1px solid var(--border);
+  cursor: pointer; transition: all 0.2s; text-align: center;
+  background: var(--panel); margin: 0;
+}
+.tone-card label:hover { border-color: var(--border-bright); background: rgba(139,92,246,0.06); }
+.tone-card input:checked + label {
+  border-color: var(--accent-a); background: rgba(139,92,246,0.14);
+  box-shadow: 0 0 14px rgba(139,92,246,0.22);
+}
+.tone-icon { font-size: 22px; }
+.tone-name { font-size: 12px; font-weight: 700; color: var(--text); }
+.tone-desc { font-size: 10px; color: var(--muted); line-height: 1.3; }
+
+/* ── Theme cards ─────────────────────────────────────── */
+.theme-grid {
+  display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px;
+}
+@media (max-width: 600px) { .theme-grid { grid-template-columns: repeat(2, 1fr); } }
+.theme-card input { display: none; }
+.theme-card > label {
+  display: flex; flex-direction: column; border-radius: 12px;
+  border: 1px solid var(--border); overflow: hidden;
+  cursor: pointer; transition: all 0.2s; margin: 0;
+}
+.theme-card > label:hover {
+  border-color: var(--border-bright); transform: translateY(-2px);
+  box-shadow: 0 6px 20px rgba(0,0,0,0.25);
+}
+.theme-card input:checked + label {
+  border-color: var(--accent-a);
+  box-shadow: 0 0 0 2px rgba(139,92,246,0.35), 0 6px 20px rgba(0,0,0,0.3);
+}
+.theme-preview { height: 56px; width: 100%; flex-shrink: 0; }
+.theme-card-info { padding: 9px 12px; background: var(--panel); }
+.theme-card-name { font-size: 13px; font-weight: 700; color: var(--text); }
+.theme-card-desc { font-size: 10px; color: var(--muted); margin-top: 2px; }
+
 /* ── Button ──────────────────────────────────────────── */
 .btn-generate {
   width: 100%; margin-top: 24px; padding: 16px;
@@ -1650,51 +1807,72 @@ footer strong { color: var(--accent-a); }
       </script>
     </div>
 
-    <div class="fields-row">
-      <div class="field">
-        <label>Тон</label>
-        <select id="tone" name="tone">
-          <option value="professional">Профессиональный</option>
-          <option value="creative">Творческий</option>
-          <option value="academic">Академический</option>
-          <option value="casual">Дружелюбный</option>
-          <option value="persuasive">Убедительный</option>
-        </select>
-      </div>
-      <div class="field">
-        <label>Визуальный стиль</label>
-        <select id="style" name="style">
-          <option value="modern">Modern Dark</option>
-          <option value="rostelecom" selected>Ростелеком</option>
-          <option value="corporate">Corporate</option>
-          <option value="minimal">Minimal</option>
-          <option value="tech">Tech Green</option>
-        </select>
+    <div class="field">
+      <label>Тон подачи</label>
+      <div class="tone-grid">
+        <div class="tone-card">
+          <input type="radio" name="tone" id="t-professional" value="professional" checked>
+          <label for="t-professional"><span class="tone-icon">👔</span><span class="tone-name">Деловой</span><span class="tone-desc">строго и чётко</span></label>
+        </div>
+        <div class="tone-card">
+          <input type="radio" name="tone" id="t-creative" value="creative">
+          <label for="t-creative"><span class="tone-icon">🎨</span><span class="tone-name">Творческий</span><span class="tone-desc">образно и ярко</span></label>
+        </div>
+        <div class="tone-card">
+          <input type="radio" name="tone" id="t-academic" value="academic">
+          <label for="t-academic"><span class="tone-icon">🎓</span><span class="tone-name">Академический</span><span class="tone-desc">точно и строго</span></label>
+        </div>
+        <div class="tone-card">
+          <input type="radio" name="tone" id="t-casual" value="casual">
+          <label for="t-casual"><span class="tone-icon">💬</span><span class="tone-name">Дружелюбный</span><span class="tone-desc">просто и понятно</span></label>
+        </div>
+        <div class="tone-card">
+          <input type="radio" name="tone" id="t-persuasive" value="persuasive">
+          <label for="t-persuasive"><span class="tone-icon">⚡</span><span class="tone-name">Убедительный</span><span class="tone-desc">мощно и динамично</span></label>
+        </div>
       </div>
     </div>
 
-    <div class="field">
-      <label>Тема презентации (шаблон слайдов)</label>
-      <div class="option-grid">
-        <div class="option-item">
-          <input type="radio" name="style-radio" id="s-rostelecom" value="rostelecom" checked onchange="document.getElementById('style').value=this.value">
-          <label for="s-rostelecom"><span class="emoji">🚀</span>Ростелеком</label>
+      <label>Визуальная тема</label>
+      <div class="theme-grid">
+        <div class="theme-card">
+          <input type="radio" name="style" id="s-rostelecom" value="rostelecom" checked>
+          <label for="s-rostelecom">
+            <div class="theme-preview" style="background:linear-gradient(160deg,#0A0F1E 0%,#1A0A3E 100%);border-top:4px solid #7700FF"></div>
+            <div class="theme-card-info"><div class="theme-card-name">Ростелеком</div><div class="theme-card-desc">Тёмный · фиолетовый акцент</div></div>
+          </label>
         </div>
-        <div class="option-item">
-          <input type="radio" name="style-radio" id="s-modern" value="modern" onchange="document.getElementById('style').value=this.value">
-          <label for="s-modern"><span class="emoji">🌙</span>Modern Dark</label>
+        <div class="theme-card">
+          <input type="radio" name="style" id="s-modern" value="modern">
+          <label for="s-modern">
+            <div class="theme-preview" style="background:linear-gradient(160deg,#0F172A 0%,#1E3A5F 100%);border-top:4px solid #38BDF8"></div>
+            <div class="theme-card-info"><div class="theme-card-name">Modern Dark</div><div class="theme-card-desc">Тёмный · голубой акцент</div></div>
+          </label>
         </div>
-        <div class="option-item">
-          <input type="radio" name="style-radio" id="s-corporate" value="corporate" onchange="document.getElementById('style').value=this.value">
-          <label for="s-corporate"><span class="emoji">🏢</span>Corporate</label>
+        <div class="theme-card">
+          <input type="radio" name="style" id="s-corporate" value="corporate">
+          <label for="s-corporate">
+            <div class="theme-preview" style="background:linear-gradient(160deg,#F1F5F9 0%,#DBEAFE 100%);border-top:4px solid #2563EB"></div>
+            <div class="theme-card-info"><div class="theme-card-name">Corporate</div><div class="theme-card-desc">Светлый · синий акцент</div></div>
+          </label>
+        </div>
+        <div class="theme-card">
+          <input type="radio" name="style" id="s-tech" value="tech">
+          <label for="s-tech">
+            <div class="theme-preview" style="background:linear-gradient(160deg,#071A0E 0%,#0D2B18 100%);border-top:4px solid #22C55E"></div>
+            <div class="theme-card-info"><div class="theme-card-name">Tech</div><div class="theme-card-desc">Тёмный · зелёный акцент</div></div>
+          </label>
         </div>
         <div class="option-item">
           <input type="radio" name="style-radio" id="s-minimal" value="minimal" onchange="document.getElementById('style').value=this.value">
           <label for="s-minimal"><span class="emoji">⬜</span>Minimal</label>
         </div>
-        <div class="option-item">
-          <input type="radio" name="style-radio" id="s-tech" value="tech" onchange="document.getElementById('style').value=this.value">
-          <label for="s-tech"><span class="emoji">💻</span>Tech</label>
+        <div class="theme-card">
+          <input type="radio" name="style" id="s-creative" value="creative">
+          <label for="s-creative">
+            <div class="theme-preview" style="background:linear-gradient(160deg,#1E0A35 0%,#3D0F52 100%);border-top:4px solid #F97316"></div>
+            <div class="theme-card-info"><div class="theme-card-name">Creative</div><div class="theme-card-desc">Тёмный · оранжевый акцент</div></div>
+          </label>
         </div>
       </div>
     </div>
@@ -1938,8 +2116,8 @@ async function generate() {
     const rtToken = document.getElementById('rt-token').value.trim();
     const rtService = document.getElementById('rt-service').value;
     const slideCount = document.getElementById('slide-count').value;
-    const style = document.getElementById('style').value;
-    const tone = document.getElementById('tone').value;
+    const style = document.querySelector('input[name="style"]:checked')?.value || 'rostelecom';
+    const tone  = document.querySelector('input[name="tone"]:checked')?.value  || 'professional';
     currentStyle = style;
 
     const btn = document.getElementById('gen-btn');
@@ -2214,13 +2392,11 @@ function resetForm() {
   document.getElementById('progress-percent').textContent = '0%';
 }
 
-// Sync radio buttons with select
-document.getElementById('style').addEventListener('change', function() {
-  const val = this.value;
-  currentStyle = val;
-  const radio = document.querySelector(`input[name="style-radio"][value="${val}"]`);
-  if (radio) radio.checked = true;
+// Sync currentStyle with theme radio selection
+document.querySelectorAll('input[name="style"]').forEach(r => {
+  r.addEventListener('change', () => { currentStyle = r.value; });
 });
+currentStyle = document.querySelector('input[name="style"]:checked')?.value || 'rostelecom';
 
 document.getElementById('generator-form').addEventListener('submit', function(event) {
   const prompt = document.getElementById('prompt').value.trim();
