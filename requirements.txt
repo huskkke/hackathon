@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+python-multipart
+anthropic
+PyPDF2
+python-docx
+requests
+python-pptx
+Pillow
