@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="AutoImportSettings">
+    <option name="autoReloadType" value="SELECTIVE" />
+  </component>
+  <component name="ChangeListManager">
+    <list default="true" id="3c626889-79ca-4cdc-9c8b-c8c642380150" name="Changes" comment="">
+      <change beforePath="$PROJECT_DIR$/README.md" beforeDir="false" afterPath="$PROJECT_DIR$/README.md" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/iigenerator/.idea/.gitignore" beforeDir="false" afterPath="$PROJECT_DIR$/iigenerator/.idea/.gitignore" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/iigenerator/.idea/iigenerator.iml" beforeDir="false" afterPath="$PROJECT_DIR$/iigenerator/.idea/iigenerator.iml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/iigenerator/.idea/misc.xml" beforeDir="false" afterPath="$PROJECT_DIR$/iigenerator/.idea/misc.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/iigenerator/.idea/modules.xml" beforeDir="false" afterPath="$PROJECT_DIR$/iigenerator/.idea/modules.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/iigenerator/app.py" beforeDir="false" afterPath="$PROJECT_DIR$/iigenerator/app.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/iigenerator/main.py" beforeDir="false" afterPath="$PROJECT_DIR$/iigenerator/main.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/requirements.txt" beforeDir="false" afterPath="$PROJECT_DIR$/requirements.txt" afterDir="false" />
+    </list>
+    <option name="SHOW_DIALOG" value="false" />
+    <option name="HIGHLIGHT_CONFLICTS" value="true" />
+    <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
+    <option name="LAST_RESOLUTION" value="IGNORE" />
+  </component>
+  <component name="EmbeddingIndexingInfo">
+    <option name="cachedIndexableFilesCount" value="14" />
+  </component>
+  <component name="Git.Settings">
+    <option name="RECENT_GIT_ROOT_PATH" value="$PROJECT_DIR$" />
+  </component>
+  <component name="McpProjectServerCommands">
+    <commands />
+    <urls />
+  </component>
+  <component name="ProjectColorInfo">{
+  &quot;associatedIndex&quot;: 1,
+  &quot;fromUser&quot;: false
+}</component>
+  <component name="ProjectId" id="3CyiPkQZDKqdGmEsuP6f2ERU5OA" />
+  <component name="ProjectViewState">
+    <option name="hideEmptyMiddlePackages" value="true" />
+    <option name="showLibraryContents" value="true" />
+  </component>
+  <component name="PropertiesComponent"><![CDATA[{
+  "keyToString": {
+    "ModuleVcsDetector.initialDetectionPerformed": "true",
+    "RunOnceActivity.MCP Project settings loaded": "true",
+    "RunOnceActivity.ShowReadmeOnStart": "true",
+    "RunOnceActivity.git.unshallow": "true",
+    "git-widget-placeholder": "test__windows",
+    "last_opened_file_path": "C:/Users/f4ddlaptop/Documents/GitHub/hackathon",
+    "settings.editor.selected.configurable": "preferences.keymap"
+  }
+}]]></component>
+  <component name="SharedIndexes">
+    <attachedChunks>
+      <set>
+        <option value="bundled-python-sdk-1cd77e80b48f-6d6dccd035ac-com.jetbrains.pycharm.pro.sharedIndexes.bundled-PY-253.32098.74" />
+      </set>
+    </attachedChunks>
+  </component>
+  <component name="TaskManager">
+    <task active="true" id="Default" summary="Default task">
+      <changelist id="3c626889-79ca-4cdc-9c8b-c8c642380150" name="Changes" comment="" />
+      <created>1777364191155</created>
+      <option name="number" value="Default" />
+      <option name="presentableId" value="Default" />
+      <updated>1777364191155</updated>
+    </task>
+    <servers />
+  </component>
+</project>

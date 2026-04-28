@@ -17,7 +17,7 @@ import uvicorn
 
 # ── Setup ─────────────────────────────────────────────────────────────────────
 
-WORK_DIR = Path("/tmp/presentai")
+WORK_DIR = Path("./temp_files")
 WORK_DIR.mkdir(exist_ok=True)
 SCRIPT_DIR = Path(__file__).parent
 
