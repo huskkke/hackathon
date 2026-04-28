@@ -5,14 +5,7 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="3c626889-79ca-4cdc-9c8b-c8c642380150" name="Changes" comment="">
-      <change beforePath="$PROJECT_DIR$/README.md" beforeDir="false" afterPath="$PROJECT_DIR$/README.md" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/iigenerator/.idea/.gitignore" beforeDir="false" afterPath="$PROJECT_DIR$/iigenerator/.idea/.gitignore" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/iigenerator/.idea/iigenerator.iml" beforeDir="false" afterPath="$PROJECT_DIR$/iigenerator/.idea/iigenerator.iml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/iigenerator/.idea/misc.xml" beforeDir="false" afterPath="$PROJECT_DIR$/iigenerator/.idea/misc.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/iigenerator/.idea/modules.xml" beforeDir="false" afterPath="$PROJECT_DIR$/iigenerator/.idea/modules.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/iigenerator/app.py" beforeDir="false" afterPath="$PROJECT_DIR$/iigenerator/app.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/iigenerator/main.py" beforeDir="false" afterPath="$PROJECT_DIR$/iigenerator/main.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/requirements.txt" beforeDir="false" afterPath="$PROJECT_DIR$/requirements.txt" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -23,6 +16,19 @@
     <option name="cachedIndexableFilesCount" value="14" />
   </component>
   <component name="Git.Settings">
+    <favorite-branches>
+      <branch-storage>
+        <map>
+          <entry type="LOCAL">
+            <value>
+              <list>
+                <branch-info repo="$PROJECT_DIR$" source="main_Windows" />
+              </list>
+            </value>
+          </entry>
+        </map>
+      </branch-storage>
+    </favorite-branches>
     <option name="RECENT_GIT_ROOT_PATH" value="$PROJECT_DIR$" />
   </component>
   <component name="McpProjectServerCommands">
@@ -44,7 +50,7 @@
     "RunOnceActivity.MCP Project settings loaded": "true",
     "RunOnceActivity.ShowReadmeOnStart": "true",
     "RunOnceActivity.git.unshallow": "true",
-    "git-widget-placeholder": "test__windows",
+    "git-widget-placeholder": "main__Windows",
     "last_opened_file_path": "C:/Users/f4ddlaptop/Documents/GitHub/hackathon",
     "settings.editor.selected.configurable": "preferences.keymap"
   }

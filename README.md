@@ -22,11 +22,11 @@
 
 ### Windows PowerShell
 
-```powershell
+```CMD
 cd путь\к\папке\hackathon
 py -3 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-.\.venv\Scripts\python.exe iigenerator\app.py
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt (Либо устанавливаете вручную через requirements.txt)
+python -m uvicorn iigenerator.app:app --reload
 ```
 
 Если PowerShell не разрешает запускать скрипты виртуального окружения, используйте команды выше именно через `.\.venv\Scripts\python.exe` - активация окружения не требуется.
