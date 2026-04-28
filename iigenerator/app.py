@@ -4,9 +4,9 @@ PresentAI — AI Presentation Generator
 Hackathon: Амурский Код 2026 | Кейс: Ростелеком
 """
 
-import os, uuid, json, io, time, re, base64, traceback, zipfile
+import os, uuid, json, io, time, re, base64, traceback, zipfile, copy
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Any
 from xml.sax.saxutils import escape
 import asyncio
 
@@ -17,18 +17,23 @@ import uvicorn
 
 # ── Setup ─────────────────────────────────────────────────────────────────────
 
-WORK_DIR = Path("/tmp/presentai")
+WORK_DIR = Path("./temp_files")
 WORK_DIR.mkdir(exist_ok=True)
 SCRIPT_DIR = Path(__file__).parent
 
 # RT API (optional — used if token provided)
 RT_API_BASE = "https://ai.rt.ru/api/1.0"
 RT_LLM_MODEL = "Qwen/Qwen2.5-72B-Instruct"
+# The RT LLM endpoint is sensitive to oversized payloads. 1536 is the safe
+# documented output size for /llama/chat; larger values often return HTTP 400.
+RT_LLM_MAX_NEW_TOKENS = 1536
+RT_LLM_MAX_PROMPT_CHARS = 24000
 
 app = FastAPI(title="PresentAI")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 JOBS: dict[str, dict] = {}
+SESSION_SECRETS: dict[str, dict] = {}  # runtime-only token/context storage; tokens are not written to disk
 
 # ── Document extraction ───────────────────────────────────────────────────────
 
@@ -130,34 +135,80 @@ def _find_text_in_response(data: object) -> str:
                 return found
     return ""
 
-def _call_rt_llm(prompt: str, token: str) -> str:
+def _decode_rt_response_body(resp: object, limit: int = 900) -> str:
+    """Decode RT API errors as UTF-8 so Russian messages are readable."""
+    if resp is None:
+        return ""
+    try:
+        content = getattr(resp, "content", b"") or b""
+        if isinstance(content, bytes) and content:
+            text = content.decode("utf-8", errors="replace")
+        else:
+            text = str(getattr(resp, "text", "") or "")
+    except Exception:
+        text = str(getattr(resp, "text", "") or "")
+    return text.strip()[:limit]
+
+def _safe_rt_max_tokens(value: int) -> int:
+    """Keep max_new_tokens inside the RT endpoint's stable range."""
+    try:
+        requested = int(value)
+    except Exception:
+        requested = RT_LLM_MAX_NEW_TOKENS
+    return max(64, min(RT_LLM_MAX_NEW_TOKENS, requested))
+
+def _compact_rt_prompt(prompt: object, limit: int = RT_LLM_MAX_PROMPT_CHARS) -> str:
+    """Trim accidental huge prompts while preserving beginning and ending context."""
+    text = str(prompt or "").replace("\x00", "").strip()
+    if len(text) <= limit:
+        return text
+    head = max(1000, limit // 2)
+    tail = max(1000, limit - head - 200)
+    return text[:head].rstrip() + "\n\n...[контекст сокращён, чтобы запрос прошёл лимит RT API]...\n\n" + text[-tail:].lstrip()
+
+def _call_rt_llm(
+    prompt: str,
+    token: str,
+    system_prompt: str = SYSTEM_PROMPT,
+    max_new_tokens: int = 1536,
+    temperature: float = 0.25,
+) -> str:
     import requests as req
+
+    safe_prompt = _compact_rt_prompt(prompt)
+    safe_max_tokens = _safe_rt_max_tokens(max_new_tokens)
+    content_item = {"type": "text", "text": safe_prompt}
 
     payload = {
         "uuid": str(uuid.uuid4()),
         "chat": {
             "model": RT_LLM_MODEL,
-            "contents": [{"type": "text", "text": prompt}],
-            "system_prompt": SYSTEM_PROMPT,
-            "max_new_tokens": 1800,
-            "temperature": 0.25,
+            "user_message": safe_prompt,
+            "contents": [content_item],
+            "system_prompt": system_prompt,
+            "max_new_tokens": safe_max_tokens,
+            "temperature": temperature,
+            "top_k": 40,
             "top_p": 0.9,
+            "no_repeat_ngram_size": 15,
             "repetition_penalty": 1.05,
         },
     }
     try:
         resp = req.post(
             f"{RT_API_BASE}/llama/chat",
-            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json; charset=utf-8"},
             json=payload,
-            timeout=60,
+            timeout=75,
         )
         resp.raise_for_status()
     except req.HTTPError as e:
-        body = e.response.text[:500] if e.response is not None else ""
-        raise RuntimeError(f"HTTP {e.response.status_code if e.response is not None else ''}: {body}") from e
+        response = e.response
+        status = response.status_code if response is not None else ""
+        body = _decode_rt_response_body(response)
+        raise RuntimeError(f"HTTP {status}: {body}") from e
 
-    raw = resp.text.strip()
+    raw = _decode_rt_response_body(resp, limit=200000)
     if not raw:
         raise RuntimeError(f"RT API вернул пустой ответ, HTTP {resp.status_code}")
     try:
@@ -292,6 +343,666 @@ def _normalize_slide_structure(data: dict, slide_count: int) -> dict:
     data.setdefault("metadata", {"title": data["presentation_title"], "author": "PresentAI", "contact": ""})
     return data
 
+
+# ── Second LLM quality reviewer / slide editor ───────────────────────────────
+
+QUALITY_SYSTEM_PROMPT = """Ты — независимый второй LLM-агент контроля качества презентаций.
+Твоя задача — проверять структуру, достоверность, читаемость, визуальный баланс и при необходимости редактировать JSON слайдов.
+Всегда отвечай только валидным JSON без markdown, пояснений и лишнего текста."""
+
+SINGLE_SLIDE_EDITOR_SYSTEM_PROMPT = """Ты — LLM-редактор одного слайда презентации.
+Редактируй только указанный слайд, не меняй всю презентацию. Возвращай только валидный JSON без markdown."""
+
+ALLOWED_LAYOUTS = {"title", "content", "two_column", "stats", "quote", "section_break", "conclusion", "section", "image"}
+
+SLIDE_TEXT_LIMITS = {
+    "title": {"title": 78, "body": 155, "items": 1, "item": 155},
+    "content": {"title": 82, "body": 520, "items": 5, "item": 115},
+    "two_column": {"title": 78, "body": 620, "items": 4, "item": 95},
+    "stats": {"title": 78, "body": 360, "items": 3, "item": 70},
+    "quote": {"title": 78, "body": 360, "items": 1, "item": 360},
+    "section_break": {"title": 78, "body": 220, "items": 1, "item": 220},
+    "conclusion": {"title": 78, "body": 430, "items": 1, "item": 430},
+    "section": {"title": 78, "body": 220, "items": 1, "item": 220},
+    "image": {"title": 78, "body": 260, "items": 3, "item": 90},
+}
+
+def _clean_text(value: object) -> str:
+    value = str(value or "")
+    value = re.sub(r"\s+", " ", value).strip()
+    return value
+
+def _clip_text(value: object, limit: int, suffix: str = "…") -> str:
+    text = _clean_text(value)
+    if len(text) <= limit:
+        return text
+    cut = max(0, limit - len(suffix))
+    part = text[:cut].rstrip()
+    sentence_cut = max(part.rfind(". "), part.rfind("; "), part.rfind(", "), part.rfind(" — "))
+    if sentence_cut >= max(30, int(limit * 0.55)):
+        part = part[:sentence_cut].rstrip(" .;,—-")
+    return part.rstrip(" .;,—-") + suffix
+
+def _as_text_list(value: object) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        result = []
+        for item in value:
+            if isinstance(item, dict):
+                text = item.get("text") or item.get("label") or item.get("title") or ""
+            else:
+                text = item
+            cleaned = _clean_text(text)
+            if cleaned:
+                result.append(cleaned)
+        return result
+    if isinstance(value, str):
+        lines = [x.strip(" •-\t") for x in re.split(r"\n+|(?:^|\s)[•▪▫◦‣]\s*", value) if x.strip(" •-\t")]
+        if len(lines) <= 1:
+            lines = [x.strip(" •-\t") for x in re.split(r";\s+|(?<=[.!?])\s+(?=[А-ЯA-Z0-9])", value) if x.strip(" •-\t")]
+        return [_clean_text(x) for x in lines if _clean_text(x)]
+    cleaned = _clean_text(value)
+    return [cleaned] if cleaned else []
+
+def _slide_plain_text(slide: dict) -> str:
+    parts: list[str] = []
+    for key in ("title", "subtitle", "content", "quote", "leftTitle", "rightTitle"):
+        if slide.get(key):
+            parts.append(str(slide.get(key)))
+    for key in ("bullets", "leftContent", "rightContent"):
+        parts.extend(_as_text_list(slide.get(key)))
+    for stat in slide.get("stats", []) or []:
+        if isinstance(stat, dict):
+            parts.append(str(stat.get("value", "")))
+            parts.append(str(stat.get("label", "")))
+    return _clean_text(" ".join(parts))
+
+def _slide_density(slide: dict) -> dict:
+    text = _slide_plain_text(slide)
+    layout = str(slide.get("layout") or "content")
+    limits = SLIDE_TEXT_LIMITS.get(layout, SLIDE_TEXT_LIMITS["content"])
+    line_count = max(1, text.count("\n") + len(re.findall(r"[.!?;]\s", text)) + 1)
+    item_count = 0
+    if layout == "two_column":
+        item_count = len(_as_text_list(slide.get("leftContent"))) + len(_as_text_list(slide.get("rightContent")))
+    elif layout == "stats":
+        item_count = len(slide.get("stats") or [])
+    elif layout == "content":
+        item_count = len(_as_text_list(slide.get("bullets")))
+    ratio = max(
+        len(text) / max(1, limits["body"]),
+        item_count / max(1, limits["items"]),
+        line_count / 12,
+    )
+    return {"chars": len(text), "line_count": line_count, "item_count": item_count, "ratio": round(ratio, 2)}
+
+def _doc_keyword_set(doc_text: str) -> set[str]:
+    words = re.findall(r"[A-Za-zА-Яа-яЁё0-9]{4,}", (doc_text or "").lower())
+    stop = {
+        "которые", "которая", "который", "также", "может", "можно", "нужно",
+        "этого", "этой", "если", "были", "будет", "через", "после", "перед",
+        "their", "with", "from", "this", "that", "have", "will", "about",
+    }
+    return {w for w in words if w not in stop}
+
+def _slide_numbers(text: str) -> set[str]:
+    return {m.group(0) for m in re.finditer(r"(?<![\w])\d{2,}(?:[.,]\d+)?%?(?![\w])", text or "")}
+
+def _append_issue(issues: list[dict], slide_num: int, severity: str, issue: str, fix: str = "") -> None:
+    issues.append({
+        "slide": slide_num,
+        "severity": severity,
+        "issue": issue,
+        "fix": fix,
+    })
+
+def _normalize_layout_name(layout: object) -> str:
+    layout = str(layout or "content").strip().lower().replace("-", "_").replace(" ", "_")
+    return layout if layout in ALLOWED_LAYOUTS else "content"
+
+def _sanitize_slide_for_quality(
+    slide: dict,
+    index: int,
+    total: int,
+    doc_keywords: Optional[set[str]] = None,
+    doc_text: str = "",
+) -> tuple[dict, list[dict], list[str]]:
+    """Apply deterministic safety edits so text does not overflow and slide order stays valid."""
+    s = copy.deepcopy(slide if isinstance(slide, dict) else {})
+    issues: list[dict] = []
+    corrections: list[str] = []
+    slide_num = index + 1
+
+    layout = _normalize_layout_name(s.get("layout"))
+    if layout == "section":
+        layout = "section_break"
+    if index == 0 and layout != "title":
+        _append_issue(issues, slide_num, "medium", "Первый слайд был не титульным.", "layout изменён на title")
+        corrections.append(f"Слайд {slide_num}: установлен титульный layout.")
+        layout = "title"
+    if index == total - 1 and layout != "conclusion":
+        _append_issue(issues, slide_num, "medium", "Последний слайд был не заключительным.", "layout изменён на conclusion")
+        corrections.append(f"Слайд {slide_num}: установлен заключительный layout.")
+        layout = "conclusion"
+    s["layout"] = layout
+
+    limits = SLIDE_TEXT_LIMITS.get(layout, SLIDE_TEXT_LIMITS["content"])
+
+    title = _clean_text(s.get("title")) or ("Презентация" if layout == "title" else f"Слайд {slide_num}")
+    clipped_title = _clip_text(title, limits["title"])
+    if clipped_title != title:
+        _append_issue(issues, slide_num, "low", "Заголовок слишком длинный для слайда.", "заголовок сокращён")
+        corrections.append(f"Слайд {slide_num}: сокращён заголовок.")
+    s["title"] = clipped_title
+
+    if layout == "title":
+        subtitle = _clean_text(s.get("subtitle") or s.get("content") or "")
+        s["subtitle"] = _clip_text(subtitle, limits["body"])
+        if len(subtitle) > limits["body"]:
+            corrections.append(f"Слайд {slide_num}: сокращён подзаголовок титульного слайда.")
+    elif layout == "two_column":
+        left_title = _clip_text(s.get("leftTitle") or "Ключевой блок", 42)
+        right_title = _clip_text(s.get("rightTitle") or "Детали", 42)
+        left = _as_text_list(s.get("leftContent"))
+        right = _as_text_list(s.get("rightContent"))
+        if not left and s.get("content"):
+            items = _as_text_list(s.get("content"))
+            half = max(1, (len(items) + 1) // 2)
+            left, right = items[:half], items[half:]
+        max_each = limits["items"]
+        old_count = len(left) + len(right)
+        left = [_clip_text(x, limits["item"]) for x in left[:max_each]]
+        right = [_clip_text(x, limits["item"]) for x in right[:max_each]]
+        if len(left) + len(right) < old_count:
+            _append_issue(issues, slide_num, "medium", "В двухколоночном слайде было слишком много пунктов.", "лишние пункты убраны")
+            corrections.append(f"Слайд {slide_num}: уменьшено количество пунктов в колонках.")
+        s["leftTitle"] = left_title
+        s["rightTitle"] = right_title
+        s["leftContent"] = left or ["Ключевой тезис"]
+        s["rightContent"] = right or ["Практический вывод"]
+    elif layout == "stats":
+        raw_stats = s.get("stats") if isinstance(s.get("stats"), list) else []
+        stats = []
+        for n, stat in enumerate(raw_stats[:limits["items"]], start=1):
+            if isinstance(stat, dict):
+                value = _clip_text(stat.get("value") or str(n), 18)
+                label = _clip_text(stat.get("label") or "Показатель", 62)
+            else:
+                value = str(n)
+                label = _clip_text(stat, 62)
+            stats.append({"value": value, "label": label})
+        if not stats:
+            stats = [{"value": "1", "label": "Главный показатель"}, {"value": "2", "label": "Ключевой риск"}, {"value": "3", "label": "Следующий шаг"}]
+        if len(raw_stats) > limits["items"]:
+            _append_issue(issues, slide_num, "low", "Статистический слайд содержал больше трёх карточек.", "оставлены три ключевых показателя")
+            corrections.append(f"Слайд {slide_num}: статистика сокращена до трёх карточек.")
+        content = _clean_text(s.get("content") or s.get("subtitle") or "")
+        s["stats"] = stats
+        s["content"] = _clip_text(content, limits["body"])
+    elif layout == "quote":
+        quote = _clean_text(s.get("quote") or s.get("content") or s.get("subtitle") or "")
+        if not quote:
+            quote = "Ключевая мысль презентации должна быть понятной и проверяемой."
+        s["quote"] = _clip_text(quote, limits["body"])
+    elif layout in {"section_break", "conclusion"}:
+        content = _clean_text(s.get("content") or s.get("subtitle") or "")
+        s["content"] = _clip_text(content, limits["body"])
+        s["subtitle"] = s["content"]
+        if layout == "conclusion" and not s["content"]:
+            s["content"] = "Суммируйте ключевые выводы, риски и следующий практический шаг."
+            s["subtitle"] = s["content"]
+    else:
+        bullets = _as_text_list(s.get("bullets"))
+        if not bullets and s.get("content"):
+            bullets = _as_text_list(s.get("content"))
+        if not bullets:
+            bullets = ["Ключевой тезис", "Практическое значение", "Следующий шаг"]
+        old_count = len(bullets)
+        bullets = [_clip_text(x, limits["item"]) for x in bullets[:limits["items"]]]
+        if old_count > limits["items"]:
+            _append_issue(issues, slide_num, "medium", "Слайд содержал слишком много пунктов и мог выглядеть перегруженным.", "количество пунктов сокращено")
+            corrections.append(f"Слайд {slide_num}: сокращён список пунктов.")
+        s["bullets"] = bullets
+
+    density = _slide_density(s)
+    if density["ratio"] > 1.15:
+        _append_issue(
+            issues,
+            slide_num,
+            "medium",
+            f"Слайд может быть визуально перегружен: {density['chars']} символов.",
+            "текст сокращён локальным контролёром",
+        )
+
+    if doc_keywords:
+        plain = _slide_plain_text(s).lower()
+        words = {w for w in re.findall(r"[A-Za-zА-Яа-яЁё0-9]{4,}", plain) if len(w) >= 4}
+        meaningful = {w for w in words if not w.isdigit()}
+        overlap = meaningful & doc_keywords
+        if len(meaningful) >= 8 and len(overlap) <= 1 and index not in (0, total - 1):
+            _append_issue(
+                issues,
+                slide_num,
+                "low",
+                "Часть текста слайда слабо связана с загруженным документом.",
+                "рекомендуется уточнить источники или переформулировать тезисы",
+            )
+        doc_numbers = _slide_numbers(doc_text)
+        for num in sorted(_slide_numbers(plain)):
+            if num not in doc_numbers:
+                _append_issue(
+                    issues,
+                    slide_num,
+                    "medium",
+                    f"Числовое значение «{num}» не найдено в исходном документе.",
+                    "число оставлено, но отмечено для проверки пользователем",
+                )
+
+    return s, issues, corrections
+
+def _local_quality_review_and_edit(
+    structure: dict,
+    user_prompt: str,
+    doc_text: str,
+    slide_count: int,
+    style: str,
+    tone: str,
+) -> dict:
+    reviewed = _normalize_slide_structure(copy.deepcopy(structure), slide_count)
+    doc_keywords = _doc_keyword_set(doc_text)
+    issues: list[dict] = []
+    corrections: list[str] = []
+    cleaned_slides: list[dict] = []
+    for idx, slide in enumerate(reviewed.get("slides", [])):
+        cleaned, slide_issues, slide_corrections = _sanitize_slide_for_quality(
+            slide, idx, slide_count, doc_keywords, doc_text
+        )
+        cleaned_slides.append(cleaned)
+        issues.extend(slide_issues)
+        corrections.extend(slide_corrections)
+
+    reviewed["slides"] = cleaned_slides
+    reviewed["presentation_title"] = reviewed.get("presentation_title") or (cleaned_slides[0].get("title") if cleaned_slides else "Презентация")
+    reviewed.setdefault("metadata", {"title": reviewed["presentation_title"], "author": "PresentAI", "contact": ""})
+
+    penalty = 0
+    for issue in issues:
+        penalty += {"high": 18, "medium": 9, "low": 4}.get(issue.get("severity"), 5)
+    score = max(55, min(100, 100 - penalty))
+    reviewed["quality_review"] = {
+        "source": "Локальный QA-контроль",
+        "score": score,
+        "summary": "Проверены порядок слайдов, плотность текста, базовая связность с источником и потенциальные переполнения.",
+        "issues": issues[:40],
+        "corrections": corrections[:40],
+    }
+    reviewed["review_source"] = "Локальный QA-контроль"
+    return reviewed
+
+LLM_STRIPPED_RUNTIME_KEYS = {
+    "imageData", "image_data", "imageBase64", "base64", "thumbnail", "previewImage",
+    "pptx", "file", "blob", "binary", "bytes",
+}
+
+def _strip_runtime_fields_for_llm(value: object, key: str = "") -> object:
+    """Remove generated base64/images and other runtime-only fields before sending JSON to LLM."""
+    if key in LLM_STRIPPED_RUNTIME_KEYS:
+        return None
+    if isinstance(value, dict):
+        cleaned: dict[str, object] = {}
+        for k, v in value.items():
+            if k in LLM_STRIPPED_RUNTIME_KEYS:
+                continue
+            cleaned_v = _strip_runtime_fields_for_llm(v, k)
+            if cleaned_v is not None:
+                cleaned[k] = cleaned_v
+        return cleaned
+    if isinstance(value, list):
+        return [_strip_runtime_fields_for_llm(item, key) for item in value]
+    if isinstance(value, str):
+        value_str = value.strip()
+        lower_key = key.lower()
+        if value_str.startswith("image/") or value_str.startswith("data:image"):
+            return None
+        if ("image" in lower_key or "base64" in lower_key) and len(value_str) > 500:
+            return None
+        if len(value_str) > 1800:
+            return value_str[:900].rstrip() + " ...[сокращено]... " + value_str[-650:].lstrip()
+        return value
+    return value
+
+def build_quality_review_prompt(
+    structure: dict,
+    user_prompt: str,
+    doc_text: str,
+    slide_count: int,
+    style: str,
+    tone: str,
+) -> str:
+    safe_structure = _strip_runtime_fields_for_llm(structure)
+    draft_json = json.dumps(safe_structure, ensure_ascii=False, indent=2)
+    doc_section = doc_text[:5000] if doc_text.strip() else "Документ не загружен. Проверяй фактические утверждения на осторожность формулировок; не придумывай новые цифры."
+    return f"""Проверь и отредактируй презентацию как второй независимый LLM-контролёр.
+
+ТЕМА ПОЛЬЗОВАТЕЛЯ:
+{user_prompt}
+
+ПАРАМЕТРЫ:
+- Нужно ровно {slide_count} слайдов.
+- Первый слайд: layout title.
+- Последний слайд: layout conclusion.
+- Тема оформления: {style}.
+- Тон: {tone}.
+- Язык: русский.
+- Не удаляй поля image_prompt, если они релевантны.
+- Не добавляй imageData.
+- Не меняй количество слайдов.
+- Не добавляй неподтверждённые цифры или факты.
+- Если источник не подтверждает факт, смягчи формулировку или убери число.
+- Сделай текст компактным, чтобы он не съезжал в PPTX:
+  title <= 78 символов;
+  content bullets: до 5 пунктов, каждый до 110 символов;
+  two_column: до 4 пунктов в каждой колонке;
+  stats: до 3 карточек;
+  conclusion <= 420 символов.
+
+ИСХОДНЫЙ ДОКУМЕНТ/КОНТЕКСТ:
+---
+{doc_section}
+---
+
+ЧЕРНОВИК JSON:
+{draft_json[:14000]}
+
+Верни строго JSON такого вида:
+{{
+  "presentation_title": "...",
+  "slides": [
+    {{"layout":"title","title":"...","subtitle":"..."}}
+  ],
+  "quality_review": {{
+    "score": 0,
+    "summary": "...",
+    "issues": [
+      {{"slide": 1, "severity": "low|medium|high", "issue": "...", "fix": "..."}}
+    ],
+    "corrections": ["..."]
+  }}
+}}"""
+
+def _merge_runtime_slide_fields(candidate: dict, original: dict) -> dict:
+    """Keep runtime-only fields (imageData, generated image prompt fallbacks) after LLM review."""
+    result = copy.deepcopy(candidate)
+    old_slides = original.get("slides", []) or []
+    new_slides = result.get("slides", []) or []
+    for idx, slide in enumerate(new_slides):
+        if idx >= len(old_slides):
+            continue
+        old = old_slides[idx]
+        for key in ("imageData",):
+            if old.get(key) and not slide.get(key):
+                slide[key] = old[key]
+        if old.get("image_prompt") and not slide.get("image_prompt"):
+            slide["image_prompt"] = old.get("image_prompt")
+    result["slides"] = new_slides
+    return result
+
+def _candidate_from_review_json(obj: dict, base: dict) -> dict:
+    if not isinstance(obj, dict):
+        raise ValueError("QA LLM вернула не JSON-объект")
+    if isinstance(obj.get("slides"), list):
+        return obj
+    if isinstance(obj.get("corrected_presentation"), dict):
+        return obj["corrected_presentation"]
+    if isinstance(obj.get("presentation"), dict):
+        return obj["presentation"]
+    if isinstance(obj.get("corrected_slides"), list):
+        candidate = copy.deepcopy(base)
+        candidate["slides"] = obj["corrected_slides"]
+        if isinstance(obj.get("quality_review"), dict):
+            candidate["quality_review"] = obj["quality_review"]
+        return candidate
+    raise ValueError("QA LLM не вернула массив slides")
+
+def review_and_refine_slide_structure(
+    structure: dict,
+    user_prompt: str,
+    doc_text: str,
+    slide_count: int,
+    style: str,
+    tone: str,
+    rt_token: str = "",
+) -> dict:
+    """Second-model pass: LLM quality review if token exists, local deterministic cleanup otherwise."""
+    base = _normalize_slide_structure(copy.deepcopy(structure), slide_count)
+    review_errors: list[str] = []
+
+    if rt_token.strip():
+        try:
+            prompt = build_quality_review_prompt(base, user_prompt, doc_text, slide_count, style, tone)
+            raw = _call_rt_llm(
+                prompt,
+                rt_token.strip(),
+                system_prompt=QUALITY_SYSTEM_PROMPT,
+                max_new_tokens=1536,
+                temperature=0.08,
+            )
+            obj = _extract_json_object(raw)
+            candidate = _candidate_from_review_json(obj, base)
+            candidate = _normalize_slide_structure(candidate, slide_count)
+            candidate = _merge_runtime_slide_fields(candidate, base)
+
+            # Deterministic pass after LLM to prevent overflow even if the QA answer is imperfect.
+            locally_checked = _local_quality_review_and_edit(candidate, user_prompt, doc_text, slide_count, style, tone)
+            llm_report = obj.get("quality_review") if isinstance(obj.get("quality_review"), dict) else candidate.get("quality_review", {})
+            local_report = locally_checked.get("quality_review", {})
+            merged_issues = (llm_report.get("issues") or []) + (local_report.get("issues") or [])
+            merged_corrections = (llm_report.get("corrections") or []) + (local_report.get("corrections") or [])
+            score_values = [v for v in [llm_report.get("score"), local_report.get("score")] if isinstance(v, (int, float))]
+            score = int(min(score_values)) if score_values else local_report.get("score", 90)
+
+            locally_checked["quality_review"] = {
+                "source": "RT LLM Quality Reviewer + локальный контроль",
+                "score": score,
+                "summary": llm_report.get("summary") or local_report.get("summary") or "Презентация проверена вторым LLM-агентом и локальными ограничителями.",
+                "issues": merged_issues[:50],
+                "corrections": merged_corrections[:50],
+            }
+            locally_checked["review_source"] = "RT LLM Quality Reviewer"
+            return locally_checked
+        except Exception as e:
+            review_errors.append(f"RT QA LLM: {e}")
+
+    reviewed = _local_quality_review_and_edit(base, user_prompt, doc_text, slide_count, style, tone)
+    if review_errors:
+        reviewed["review_warning"] = "Второй LLM-контролёр недоступен, применён локальный QA-контроль. " + " | ".join(review_errors)
+    elif not rt_token.strip():
+        reviewed["review_warning"] = "RT-токен не задан: вместо второго LLM-контролёра применён локальный QA-контроль."
+    return reviewed
+
+def build_single_slide_edit_prompt(
+    structure: dict,
+    slide_index: int,
+    instruction: str,
+    doc_text: str,
+) -> str:
+    slides = structure.get("slides", []) or []
+    slide = _strip_runtime_fields_for_llm(slides[slide_index])
+    context_slides = [
+        {"index": i + 1, "layout": s.get("layout"), "title": s.get("title"), "plain_text": _slide_plain_text(s)[:500]}
+        for i, s in enumerate(slides)
+    ]
+    return f"""Отредактируй только один слайд презентации.
+
+Номер слайда: {slide_index + 1}
+Инструкция пользователя:
+{instruction or "Проверь слайд и исправь структуру, читаемость, достоверность и визуальный баланс."}
+
+Исходный слайд:
+{json.dumps(slide, ensure_ascii=False, indent=2)}
+
+Контекст всей презентации:
+{json.dumps(context_slides, ensure_ascii=False, indent=2)[:6500]}
+
+Источник/документ:
+---
+{(doc_text or "Источник не загружен. Не добавляй новые факты и цифры без необходимости.")[:3500]}
+---
+
+Требования:
+- Верни только исправленный JSON одного слайда в поле "slide".
+- Не меняй остальные слайды.
+- Сохрани layout, если инструкция явно не требует другого; для первого слайда layout title, для последнего conclusion.
+- Текст должен помещаться: заголовок до 78 символов, пункты короткие, без перегруза.
+- Не добавляй неподтвержденные цифры.
+- Сохрани image_prompt, если он есть и подходит.
+- Не возвращай imageData.
+
+Формат:
+{{
+  "slide": {{"layout":"content","title":"...","bullets":["..."]}},
+  "review": {{
+    "issues": ["..."],
+    "fixes": ["..."]
+  }}
+}}"""
+
+def _slide_from_editor_payload(original: dict, payload: dict, slide_index: int, total: int) -> dict:
+    slide = copy.deepcopy(original)
+    if isinstance(payload.get("slide"), dict):
+        slide.update(payload["slide"])
+
+    if "layout" in payload and payload.get("layout"):
+        slide["layout"] = _normalize_layout_name(payload.get("layout"))
+
+    if "title" in payload:
+        slide["title"] = _clean_text(payload.get("title"))
+
+    body = payload.get("body")
+    if body is not None:
+        layout = _normalize_layout_name(slide.get("layout"))
+        body_text = str(body or "").strip()
+        if layout == "title":
+            slide["subtitle"] = body_text
+        elif layout == "quote":
+            slide["quote"] = body_text
+        elif layout in {"conclusion", "section_break", "section"}:
+            slide["content"] = body_text
+            slide["subtitle"] = body_text
+        elif layout == "stats":
+            slide["content"] = body_text
+        elif layout == "two_column":
+            lines = [x.strip(" •-\t") for x in body_text.splitlines() if x.strip(" •-\t")]
+            half = max(1, (len(lines) + 1) // 2)
+            slide["leftContent"] = lines[:half]
+            slide["rightContent"] = lines[half:]
+        else:
+            slide["bullets"] = [x.strip(" •-\t") for x in body_text.splitlines() if x.strip(" •-\t")]
+
+    if slide_index == 0:
+        slide["layout"] = "title"
+    if slide_index == total - 1:
+        slide["layout"] = "conclusion"
+    return slide
+
+def edit_single_slide_with_reviewer(
+    structure: dict,
+    slide_index: int,
+    instruction: str,
+    rt_token: str,
+    doc_text: str,
+) -> tuple[dict, dict]:
+    slides = structure.get("slides", []) or []
+    if slide_index < 0 or slide_index >= len(slides):
+        raise ValueError("Неверный номер слайда")
+
+    report: dict[str, Any] = {
+        "source": "Локальный редактор",
+        "issues": [],
+        "fixes": [],
+    }
+
+    if rt_token.strip():
+        try:
+            prompt = build_single_slide_edit_prompt(structure, slide_index, instruction, doc_text)
+            raw = _call_rt_llm(
+                prompt,
+                rt_token.strip(),
+                system_prompt=SINGLE_SLIDE_EDITOR_SYSTEM_PROMPT,
+                max_new_tokens=1200,
+                temperature=0.12,
+            )
+            obj = _extract_json_object(raw)
+            candidate = obj.get("slide") if isinstance(obj.get("slide"), dict) else obj
+            if not isinstance(candidate, dict):
+                raise ValueError("Редактор слайда не вернул объект slide")
+            original = slides[slide_index]
+            if original.get("imageData") and not candidate.get("imageData"):
+                candidate["imageData"] = original["imageData"]
+            if original.get("image_prompt") and not candidate.get("image_prompt"):
+                candidate["image_prompt"] = original["image_prompt"]
+            cleaned, issues, fixes = _sanitize_slide_for_quality(
+                candidate,
+                slide_index,
+                len(slides),
+                _doc_keyword_set(doc_text),
+                doc_text,
+            )
+            if isinstance(obj.get("review"), dict):
+                report.update(obj["review"])
+            report["source"] = "RT LLM редактор одного слайда"
+            report["issues"] = (report.get("issues") or []) + issues
+            report["fixes"] = (report.get("fixes") or []) + fixes
+            slides[slide_index] = cleaned
+            structure["slides"] = slides
+            return structure, report
+        except Exception as e:
+            report["issues"].append(f"LLM-редактор не сработал: {e}. Применены только локальные правки.")
+
+    cleaned, issues, fixes = _sanitize_slide_for_quality(
+        slides[slide_index],
+        slide_index,
+        len(slides),
+        _doc_keyword_set(doc_text),
+        doc_text,
+    )
+    slides[slide_index] = cleaned
+    structure["slides"] = slides
+    report["issues"].extend(issues)
+    report["fixes"].extend(fixes)
+    return structure, report
+
+def _session_json_path(session_id: str) -> Path:
+    if not re.fullmatch(r"[0-9a-fA-F-]{20,80}", session_id or ""):
+        raise HTTPException(400, "Некорректный session_id")
+    return WORK_DIR / f"{session_id}.json"
+
+def _session_pptx_path(session_id: str) -> Path:
+    if not re.fullmatch(r"[0-9a-fA-F-]{20,80}", session_id or ""):
+        raise HTTPException(400, "Некорректный session_id")
+    return WORK_DIR / f"{session_id}.pptx"
+
+def load_session_structure(session_id: str) -> dict:
+    json_path = _session_json_path(session_id)
+    if not json_path.exists():
+        raise HTTPException(404, "Сессия презентации не найдена")
+    with open(json_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def save_session_structure(session_id: str, structure: dict, style: str) -> None:
+    output_path = str(_session_pptx_path(session_id))
+    if not build_pptx(structure, output_path, style):
+        raise HTTPException(500, "Ошибка пересборки PPTX")
+    with open(_session_json_path(session_id), "w", encoding="utf-8") as f:
+        json.dump(structure, f, ensure_ascii=False, indent=2)
+
+def _session_context(structure: dict, session_id: str = "") -> dict:
+    context = structure.get("_presentai_context") if isinstance(structure.get("_presentai_context"), dict) else {}
+    runtime = SESSION_SECRETS.get(session_id, {}) if session_id else {}
+    merged = {**context, **runtime}
+    return merged
+
 def generate_slide_structure(user_prompt: str, doc_text: str,
                                slide_count: int, style: str, tone: str,
                                rt_token: str = "") -> dict:
@@ -387,14 +1098,12 @@ def image_bytes_to_base64(data: bytes) -> str:
 
 # ── PPTX generation ──────────────────────────────────────────────────────────
 
-THEMES = {
-    "modern": {"bg": "0F172A", "title": "F8FAFC", "text": "CBD5E1", "accent": "38BDF8"},
-    "rostelecom": {"bg": "101828", "title": "FFFFFF", "text": "D0D5DD", "accent": "7700FF"},
-    "corporate": {"bg": "FFFFFF", "title": "0F172A", "text": "334155", "accent": "2563EB"},
-    "creative": {"bg": "2A0F2F", "title": "FFF7ED", "text": "F5D0FE", "accent": "F97316"},
-    "minimal": {"bg": "FAFAFA", "title": "111827", "text": "374151", "accent": "111827"},
-    "tech": {"bg": "07130D", "title": "ECFDF5", "text": "BBF7D0", "accent": "22C55E"},
-}
+THEMES = {    "modern":     {"bg": "0F172A", "bg2": "1E3A5F", "title": "F8FAFC", "text": "CBD5E1", "accent": "38BDF8", "accent2": "818CF8"},
+    "rostelecom": {"bg": "0A0F1E", "bg2": "1A0A3E", "title": "FFFFFF", "text": "D0D5DD", "accent": "7700FF", "accent2": "C026D3"},
+    "corporate":  {"bg": "F1F5F9", "bg2": "DBEAFE", "title": "0F172A", "text": "334155", "accent": "2563EB", "accent2": "0EA5E9"},
+    "minimal":    {"bg": "FFFFFF", "bg2": "F1F5F9", "title": "111827", "text": "4B5563", "accent": "6366F1", "accent2": "8B5CF6"},
+    "tech":       {"bg": "071A0E", "bg2": "0D2B18", "title": "ECFDF5", "text": "BBF7D0", "accent": "22C55E", "accent2": "06B6D4"},
+    "creative":   {"bg": "1E0A35", "bg2": "3D0F52", "title": "FFF7ED", "text": "F5D0FE", "accent": "F97316", "accent2": "EC4899"},}
 
 def _xml_text(value: object) -> str:
     return escape(str(value or ""))
@@ -489,9 +1198,9 @@ def _slide_xml(slide: dict, index: int, colors: dict) -> str:
 </p:sld>"""
 
 def build_pptx(slide_data: dict, output_path: str, theme: str) -> bool:
-    """Build PPTX with python-pptx and embed generated images when present."""
-    slides = slide_data.get("slides") or []
-    if not slides:
+    """Build PPTX with gradient backgrounds, accent shapes, and decorative elements."""
+    slides_list = slide_data.get("slides") or []
+    if not slides_list:
         return False
 
     colors = THEMES.get(theme, THEMES["modern"])
@@ -499,81 +1208,206 @@ def build_pptx(slide_data: dict, output_path: str, theme: str) -> bool:
     try:
         from pptx import Presentation
         from pptx.dml.color import RGBColor
-        from pptx.enum.text import PP_ALIGN
         from pptx.util import Inches, Pt
+        from pptx.enum.text import PP_ALIGN
+        from pptx.oxml.ns import qn
+        from lxml import etree
 
         prs = Presentation()
         prs.slide_width = Inches(13.333)
         prs.slide_height = Inches(7.5)
         blank = prs.slide_layouts[6]
 
-        def rgb(hex_color: str) -> RGBColor:
-            return RGBColor.from_string(hex_color)
+        bg_c  = colors["bg"]
+        bg2_c = colors.get("bg2", bg_c)
+        ti_c  = colors["title"]
+        tx_c  = colors["text"]
+        ac_c  = colors["accent"]
+        ac2_c = colors.get("accent2", ac_c)
+        NS_A  = "http://schemas.openxmlformats.org/drawingml/2006/main"
 
-        def add_textbox(slide_obj, x, y, w, h, text, size=24, bold=False, color=None):
-            box = slide_obj.shapes.add_textbox(Inches(x), Inches(y), Inches(w), Inches(h))
+        def rgb(h: str) -> RGBColor:
+            return RGBColor.from_string(h)
+
+        def _grad_bg(slide, c1: str, c2: str) -> None:
+            """Set a top-to-bottom gradient background."""
+            slide.background.fill.solid()
+            slide.background.fill.fore_color.rgb = rgb(c1)
+            bgPr = slide._element.find('.//' + qn('p:bgPr'))
+            if bgPr is None:
+                return
+            for ch in list(bgPr):
+                bgPr.remove(ch)
+            bgPr.append(etree.fromstring(
+                f'<a:gradFill xmlns:a="{NS_A}" rotWithShape="1">'
+                f'<a:gsLst>'
+                f'<a:gs pos="0"><a:srgbClr val="{c1}"/></a:gs>'
+                f'<a:gs pos="100000"><a:srgbClr val="{c2}"/></a:gs>'
+                f'</a:gsLst>'
+                f'<a:lin ang="16200000" scaled="0"/>'
+                f'</a:gradFill>'
+            ))
+
+        def _shape(sl, sid: int, x, y, w, h, clr: str, alpha: int = 100):
+            """Add a filled shape. alpha 0-100: 100=opaque."""
+            sh = sl.shapes.add_shape(sid, Inches(x), Inches(y), Inches(w), Inches(h))
+            sh.line.fill.background()
+            sh.fill.solid()
+            sh.fill.fore_color.rgb = rgb(clr)
+            if alpha < 100:
+                sp = sh._element.find(qn('p:spPr'))
+                sf = sp.find('.//' + qn('a:solidFill'))
+                if sf is not None:
+                    sc = sf.find(qn('a:srgbClr'))
+                    if sc is not None:
+                        ae = etree.SubElement(sc, qn('a:alpha'))
+                        ae.set('val', str(alpha * 1000))
+            return sh
+
+        def rect(sl, x, y, w, h, clr, a=100):
+            return _shape(sl, 1, x, y, w, h, clr, a)
+
+        def oval(sl, x, y, w, h, clr, a=15):
+            return _shape(sl, 9, x, y, w, h, clr, a)
+
+        def txt(sl, x, y, w, h, text, sz=22, bold=False, clr=None,
+                align='left', wrap=True, italic=False):
+            amap = {'left': PP_ALIGN.LEFT, 'center': PP_ALIGN.CENTER, 'right': PP_ALIGN.RIGHT}
+            box = sl.shapes.add_textbox(Inches(x), Inches(y), Inches(w), Inches(h))
             tf = box.text_frame
             tf.clear()
-            tf.word_wrap = True
-            for idx, line in enumerate(str(text or "").split("\n") or [""]):
-                p = tf.paragraphs[0] if idx == 0 else tf.add_paragraph()
-                p.text = line
-                p.font.size = Pt(size)
+            tf.word_wrap = wrap
+            lines = text.split('\n') if isinstance(text, str) else list(text or [''])
+            for i, ln in enumerate(lines or ['']):
+                p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
+                p.text = str(ln)
+                p.alignment = amap.get(align, PP_ALIGN.LEFT)
+                p.font.size = Pt(sz)
                 p.font.bold = bold
-                p.font.name = "Arial"
-                p.font.color.rgb = rgb(color or colors["text"])
+                p.font.italic = italic
+                p.font.name = 'Arial'
+                p.font.color.rgb = rgb(clr or tx_c)
             return box
 
-        for index, item in enumerate(slides, start=1):
-            slide = prs.slides.add_slide(blank)
-            bg = slide.background.fill
-            bg.solid()
-            bg.fore_color.rgb = rgb(colors["bg"])
+        def fit_sz(text, base=22, min_sz=13, capacity=360, line_capacity=8):
+            raw = "\n".join(str(x) for x in text) if isinstance(text, (list, tuple)) else str(text or "")
+            chars = len(raw)
+            lines_n = max(1, raw.count("\n") + 1)
+            overflow = max(0, chars - capacity)
+            penalty = (overflow // 90) + max(0, lines_n - line_capacity)
+            return max(min_sz, int(base - penalty))
 
-            title = item.get("title") or f"Слайд {index}"
-            add_textbox(slide, 0.55, 0.35, 7.4, 1.0, title, size=30 if index > 1 else 38, bold=True, color=colors["title"])
+        def decor(sl):
+            """Decorative semi-transparent circles in corners."""
+            oval(sl,  9.5, -1.5, 6.5, 6.5, ac_c,  a=10)
+            oval(sl, -2.0,  5.0, 5.5, 5.5, ac2_c, a=7)
 
-            image_data = item.get("imageData")
-            has_image = False
-            if image_data:
-                try:
-                    raw = image_data.split(",", 1)[1] if "," in image_data else image_data
-                    stream = io.BytesIO(base64.b64decode(raw))
-                    slide.shapes.add_picture(stream, Inches(8.15), Inches(1.25), width=Inches(4.55), height=Inches(3.25))
-                    has_image = True
-                except Exception as e:
-                    print(f"Image embed failed: {e}")
+        def slide_num(sl, n):
+            txt(sl, 12.1, 7.05, 1.1, 0.3, str(n), sz=11, bold=True, clr=ac_c, align='right')
 
-            body_width = 7.2 if has_image else 11.8
-            layout = item.get("layout", "content")
-            if layout == "title":
-                add_textbox(slide, 0.7, 2.35, 11.5, 1.4, item.get("subtitle", ""), size=24, color=colors["text"])
-            elif layout == "two_column":
-                add_textbox(slide, 0.75, 1.55, 5.4, 0.45, item.get("leftTitle", "Слева"), size=20, bold=True, color=colors["accent"])
-                add_textbox(slide, 6.7, 1.55, 5.4, 0.45, item.get("rightTitle", "Справа"), size=20, bold=True, color=colors["accent"])
-                add_textbox(slide, 0.85, 2.2, 5.2, 3.9, "\n".join(f"• {x}" for x in item.get("leftContent", [])), size=18)
-                add_textbox(slide, 6.8, 2.2, 5.2, 3.9, "\n".join(f"• {x}" for x in item.get("rightContent", [])), size=18)
-            elif layout == "stats":
-                stats = item.get("stats", [])[:3]
-                for pos, stat in enumerate(stats):
-                    x = 0.75 + pos * 3.9
-                    add_textbox(slide, x, 1.55, 3.2, 0.7, stat.get("value", ""), size=30, bold=True, color=colors["accent"])
-                    add_textbox(slide, x, 2.25, 3.2, 0.7, stat.get("label", ""), size=15)
-                add_textbox(slide, 0.75, 3.45, body_width, 2.1, item.get("content", ""), size=20)
-            elif layout == "quote":
-                add_textbox(slide, 0.95, 2.0, body_width, 2.2, item.get("quote", ""), size=26, color=colors["title"])
-            elif layout == "conclusion":
-                add_textbox(slide, 0.75, 2.0, body_width, 2.4, item.get("content", item.get("subtitle", "")), size=24)
-            else:
-                bullets = item.get("bullets") or [item.get("content", "")]
-                add_textbox(slide, 0.75, 1.65, body_width, 4.5, "\n".join(f"• {x}" for x in bullets if x), size=19)
+        for idx, item in enumerate(slides_list, start=1):
+            sl = prs.slides.add_slide(blank)
+            layout = item.get('layout', 'content')
+            title  = item.get('title') or f'Слайд {idx}'
 
-            add_textbox(slide, 0.6, 6.85, 1.0, 0.3, str(index), size=12, bold=True, color=colors["accent"])
+            _grad_bg(sl, bg_c, bg2_c)
+            decor(sl)
+
+            if layout == 'title':
+                rect(sl, 0, 6.7, 13.333, 0.8, ac_c,  a=85)
+                rect(sl, 0, 6.7, 13.333, 0.8, ac2_c, a=25)
+                rect(sl, 0, 0, 0.3, 6.7, ac_c, a=90)
+                rect(sl, 0.55, 1.6, 12.3, 3.9, ac_c, a=6)
+                txt(sl, 0.9, 1.85, 11.5, 2.1, title, sz=fit_sz(title, 46, 34, 95, 2), bold=True, clr=ti_c)
+                rect(sl, 0.9, 4.0, 3.8, 0.07, ac_c)
+                sub = item.get('subtitle', '')
+                if sub:
+                    txt(sl, 0.9, 4.25, 11.0, 1.3, sub, sz=fit_sz(sub, 23, 17, 165, 3), clr=tx_c)
+
+            elif layout == 'two_column':
+                rect(sl, 0, 0, 13.333, 0.13, ac_c)
+                txt(sl, 0.5, 0.28, 12.3, 0.85, title, sz=fit_sz(title, 28, 22, 90, 2), bold=True, clr=ti_c)
+                rect(sl, 0.45, 1.4, 5.9, 5.75, ac_c,  a=10)
+                rect(sl, 0.45, 1.4, 5.9, 0.14, ac_c,  a=90)
+                txt(sl, 0.65, 1.65, 5.5, 0.55, item.get('leftTitle', ''), sz=18, bold=True, clr=ac_c)
+                left_text = '\n'.join(f'• {x}' for x in item.get('leftContent', []))
+                txt(sl, 0.65, 2.3,  5.5, 4.6,
+                    left_text, sz=fit_sz(left_text, 17, 13, 410, 7), clr=tx_c)
+                rect(sl, 6.5,  1.4, 0.07, 5.75, ac_c,  a=22)
+                rect(sl, 6.72, 1.4, 6.1,  5.75, ac2_c, a=10)
+                rect(sl, 6.72, 1.4, 6.1,  0.14, ac2_c, a=90)
+                txt(sl, 6.92, 1.65, 5.7, 0.55, item.get('rightTitle', ''), sz=18, bold=True, clr=ac2_c)
+                right_text = '\n'.join(f'• {x}' for x in item.get('rightContent', []))
+                txt(sl, 6.92, 2.3,  5.7, 4.6,
+                    right_text, sz=fit_sz(right_text, 17, 13, 420, 7), clr=tx_c)
+
+            elif layout == 'stats':
+                rect(sl, 0, 0, 13.333, 0.13, ac_c)
+                txt(sl, 0.5, 0.28, 12.3, 0.85, title, sz=fit_sz(title, 28, 22, 90, 2), bold=True, clr=ti_c)
+                stats = item.get('stats', [])[:3]
+                n_st = len(stats)
+                bw = (12.4 - (n_st - 1) * 0.4) / max(n_st, 1) if n_st else 12.4
+                for i, stat in enumerate(stats):
+                    sx = 0.45 + i * (bw + 0.4)
+                    rect(sl, sx, 1.4, bw, 2.65, ac_c, a=12)
+                    rect(sl, sx, 1.4, bw, 0.14, ac_c if i % 2 == 0 else ac2_c)
+                    txt(sl, sx + 0.1, 1.65, bw - 0.2, 1.3,
+                        stat.get('value', ''), sz=36, bold=True,
+                        clr=ac_c if i % 2 == 0 else ac2_c, align='center')
+                    txt(sl, sx + 0.1, 2.95, bw - 0.2, 0.7,
+                        stat.get('label', ''), sz=15, clr=tx_c, align='center')
+                if item.get('content'):
+                    txt(sl, 0.5, 4.3, 12.3, 2.5, item['content'], sz=fit_sz(item['content'], 19, 14, 360, 6), clr=tx_c)
+
+            elif layout == 'quote':
+                txt(sl, 0.55, 0.4, 2.5, 2.5, '❝', sz=110, clr=ac_c)
+                txt(sl, 1.5, 2.2, 10.6, 3.2, item.get('quote', ''),
+                    sz=fit_sz(item.get('quote', ''), 26, 18, 340, 7), clr=ti_c, italic=True)
+                rect(sl, 1.5, 5.6, 3.5, 0.07, ac_c)
+                if title and title != f'Слайд {idx}':
+                    txt(sl, 1.5, 5.85, 8.5, 0.6, f'— {title}', sz=15, clr=tx_c)
+
+            elif layout == 'conclusion':
+                rect(sl, 0, 6.7, 13.333, 0.8, ac2_c, a=85)
+                rect(sl, 0, 6.7, 13.333, 0.8, ac_c,  a=25)
+                rect(sl, 0, 0, 0.3, 6.7, ac2_c, a=90)
+                rect(sl, 0.55, 1.2, 12.3, 4.5, ac2_c, a=6)
+                txt(sl, 0.9, 1.45, 12.0, 1.4, title, sz=fit_sz(title, 40, 30, 90, 2), bold=True, clr=ti_c)
+                rect(sl, 0.9, 2.9, 3.5, 0.07, ac2_c)
+                content = item.get('content', item.get('subtitle', ''))
+                if content:
+                    txt(sl, 0.9, 3.15, 12.0, 3.0, content, sz=fit_sz(content, 22, 15, 420, 7), clr=tx_c)
+
+            else:  # content
+                rect(sl, 0, 0, 0.23, 7.5, ac_c)
+                txt(sl, 0.5, 0.28, 12.5, 1.0, title, sz=fit_sz(title, 32, 24, 90, 2), bold=True, clr=ti_c)
+                rect(sl, 0.5, 1.3, 4.8, 0.06, ac_c, a=65)
+                image_data = item.get('imageData')
+                has_img = False
+                if image_data:
+                    try:
+                        raw = image_data.split(',', 1)[1] if ',' in image_data else image_data
+                        stream = io.BytesIO(base64.b64decode(raw))
+                        sl.shapes.add_picture(
+                            stream, Inches(8.3), Inches(1.5),
+                            width=Inches(4.7), height=Inches(3.5)
+                        )
+                        has_img = True
+                    except Exception as e:
+                        print(f'Image embed: {e}')
+                bw = 7.5 if has_img else 12.6
+                bullets = item.get('bullets') or [item.get('content', '')]
+                bullet_text = '\n'.join(f'• {b}' for b in bullets if b)
+                txt(sl, 0.5, 1.55, bw, 5.5,
+                    bullet_text, sz=fit_sz(bullet_text, 20, 14, 520 if not has_img else 360, 8), clr=tx_c)
+
+            slide_num(sl, idx)
 
         prs.save(output_path)
         return True
     except Exception as e:
-        print(f"PPTX generation failed: {e}")
+        print(f'PPTX generation failed: {e}')
+        traceback.print_exc()
         return False
 
 def build_preview(slides: list[dict]) -> list[dict]:
@@ -594,6 +1428,8 @@ def build_preview(slides: list[dict]) -> list[dict]:
             "stats": s.get("stats", []),
             "image_prompt": s.get("image_prompt"),
             "hasImage": bool(s.get("imageData")),
+            "density": _slide_density(s),
+            "plain_text": _slide_plain_text(s),
         })
     return preview
 
@@ -625,6 +1461,28 @@ def create_presentation_from_data(
 
     slide_count = max(3, min(20, slide_count))
     structure = generate_slide_structure(prompt, doc_text, slide_count, style, tone, rt_token)
+    structure = review_and_refine_slide_structure(
+        structure, prompt, doc_text, slide_count, style, tone, rt_token
+    )
+    structure["_presentai_context"] = {
+        "prompt": prompt,
+        "style": style,
+        "tone": tone,
+        "slide_count": slide_count,
+        "document_filename": document_filename,
+        "document_excerpt": doc_text[:7000],
+        "rt_service": rt_service,
+    }
+    SESSION_SECRETS[session_id] = {
+        "rt_token": rt_token.strip(),
+        "prompt": prompt,
+        "style": style,
+        "tone": tone,
+        "slide_count": slide_count,
+        "document_excerpt": doc_text[:7000],
+        "rt_service": rt_service,
+        "created_at": time.time(),
+    }
 
     slides = structure.get("slides", [])
     if generate_images and rt_token.strip():
@@ -650,8 +1508,11 @@ def create_presentation_from_data(
         "title": structure.get("presentation_title", "Презентация"),
         "slide_count": len(slides),
         "preview": build_preview(slides),
-        "warning": structure.get("generation_warning", ""),
+        "warning": " ".join(x for x in [structure.get("generation_warning", ""), structure.get("review_warning", "")] if x).strip(),
         "source": structure.get("generation_source", ""),
+        "review_source": structure.get("review_source", ""),
+        "quality_review": structure.get("quality_review", {}),
+        "style": style,
     }
 
 async def create_presentation(
@@ -674,27 +1535,332 @@ async def create_presentation(
     )
 
 def render_result_page(data: dict) -> str:
-    slides_html = "".join(
-        f"<li><strong>{_xml_text(s.get('title'))}</strong><br>{_xml_text(s.get('subtitle') or s.get('content') or ' '.join(s.get('bullets') or []))}</li>"
-        for s in data["preview"]
-    )
-    warning = f"<p class='warning'>{_xml_text(data['warning'])}</p>" if data.get("warning") else ""
-    return f"""<!doctype html>
-<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+    safe_session = _xml_text(data.get("session_id", ""))
+    safe_title = _xml_text(data.get("title", "Презентация готова"))
+    slides_json = json.dumps(data.get("preview", []), ensure_ascii=False).replace("</", "<\\/")
+    review_json = json.dumps(data.get("quality_review", {}), ensure_ascii=False).replace("</", "<\\/")
+    warning = data.get("warning", "") or ""
+    warning_json = json.dumps(warning, ensure_ascii=False).replace("</", "<\\/")
+    source = data.get("source", "") or "неизвестен"
+    review_source = data.get("review_source", "") or "QA-контроль"
+    style = data.get("style", "rostelecom") or "rostelecom"
+
+    html = """<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Презентация готова</title>
 <style>
-body{{margin:0;background:#080313;color:#f8f5ff;font-family:Arial,sans-serif;padding:40px}}
-.wrap{{max-width:920px;margin:auto}}a,.btn{{display:inline-block;background:#8b5cf6;color:white;padding:14px 20px;border-radius:10px;text-decoration:none;font-weight:700;margin:8px 8px 18px 0}}
-.card{{background:#160d2e;border:1px solid rgba(139,92,246,.35);border-radius:14px;padding:22px}}
-li{{margin:0 0 14px;line-height:1.45}}.warning{{color:#fed7aa}}.src{{color:#a78bfa;font-weight:700}}
-</style></head><body><div class="wrap">
-<h1>{_xml_text(data["title"])}</h1>
-<p class="src">Источник генерации: {_xml_text(data.get("source") or "неизвестен")}</p>
-{warning}
-<a class="btn" href="/api/download/{data["session_id"]}">Скачать PPTX</a>
-<a class="btn" href="/">Создать еще</a>
-<div class="card"><h2>Предпросмотр</h2><ol>{slides_html}</ol></div>
-</div></body></html>"""
+* { box-sizing: border-box; }
+:root {
+  --bg:#07040f; --panel:#120a26; --panel2:#1a1035; --text:#f8f5ff; --muted:#a99ac8;
+  --accent:#8b5cf6; --accent2:#ec4e99; --ok:#22d3ee; --warn:#fed7aa; --border:rgba(139,92,246,.35);
+}
+body {
+  margin:0; min-height:100vh; background:
+  radial-gradient(circle at 10% 0%, rgba(139,92,246,.28), transparent 32%),
+  radial-gradient(circle at 95% 20%, rgba(236,78,153,.18), transparent 35%),
+  var(--bg);
+  color:var(--text); font-family:Arial, sans-serif; padding:28px;
+}
+.wrap { max-width:1180px; margin:0 auto; }
+.top { display:flex; gap:16px; align-items:flex-start; justify-content:space-between; margin-bottom:18px; }
+h1 { margin:0 0 8px; font-size:clamp(28px,4vw,44px); line-height:1.06; }
+.meta { color:var(--muted); line-height:1.45; font-size:14px; }
+.actions { display:flex; gap:10px; flex-wrap:wrap; justify-content:flex-end; }
+.btn, button {
+  display:inline-flex; align-items:center; justify-content:center; gap:8px;
+  border:1px solid var(--border); background:linear-gradient(135deg,var(--accent),var(--accent2));
+  color:white; padding:12px 16px; border-radius:12px; text-decoration:none; font-weight:800;
+  cursor:pointer; transition:.2s; font-size:14px;
+}
+.btn:hover, button:hover { transform:translateY(-1px); filter:brightness(1.06); }
+button.secondary, .btn.secondary { background:rgba(255,255,255,.06); }
+button:disabled { opacity:.55; cursor:wait; transform:none; }
+.notice {
+  margin:12px 0; padding:12px 14px; border-radius:14px; border:1px solid rgba(249,115,22,.35);
+  background:rgba(249,115,22,.12); color:var(--warn); line-height:1.45; display:none;
+}
+.qa {
+  display:grid; grid-template-columns: minmax(0,1fr) auto; gap:12px; align-items:center;
+  margin:14px 0 18px; padding:14px; border:1px solid var(--border); border-radius:16px;
+  background:rgba(18,10,38,.78);
+}
+.qa strong { color:var(--ok); }
+.score { min-width:88px; height:88px; border-radius:20px; display:grid; place-items:center;
+  background:rgba(139,92,246,.18); border:1px solid var(--border); font-size:28px; font-weight:900; }
+.layout {
+  display:grid; grid-template-columns: 1.35fr .9fr; gap:18px; align-items:start;
+}
+.card {
+  background:rgba(18,10,38,.86); border:1px solid var(--border); border-radius:18px; padding:16px;
+  box-shadow:0 24px 80px rgba(0,0,0,.22);
+}
+.preview-toolbar { display:flex; justify-content:space-between; align-items:center; gap:10px; color:var(--muted); margin-bottom:12px; font-size:13px; }
+.preview-slide {
+  aspect-ratio:16/9; width:100%; border-radius:16px; overflow:hidden; padding:5.2%;
+  background:linear-gradient(150deg,#0a0f1e,#1a0a3e); border:1px solid rgba(255,255,255,.08);
+  box-shadow:inset 0 0 120px rgba(119,0,255,.2); display:flex; flex-direction:column; justify-content:center;
+}
+.preview-slide h2 { margin:0 0 18px; font-size:clamp(26px,4vw,48px); line-height:1.08; }
+.preview-slide p, .preview-slide li { font-size:clamp(14px,1.7vw,22px); color:rgba(255,255,255,.84); line-height:1.42; }
+.preview-slide ul { margin:0; padding-left:24px; display:grid; gap:8px; }
+.preview-columns { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
+.preview-column { padding:14px; border-radius:12px; background:rgba(255,255,255,.07); }
+.preview-column h3 { margin:0 0 10px; color:white; }
+.preview-stats { display:grid; grid-template-columns:repeat(3,1fr); gap:12px; margin-bottom:16px; }
+.preview-stat { background:rgba(255,255,255,.08); border-radius:14px; padding:14px; text-align:center; }
+.preview-stat strong { display:block; font-size:28px; color:#c4b5fd; margin-bottom:6px; }
+.editor { display:grid; gap:10px; }
+label { font-size:12px; color:var(--muted); font-weight:800; text-transform:uppercase; letter-spacing:.04em; }
+input, textarea {
+  width:100%; border:1px solid var(--border); background:#0e0820; color:var(--text);
+  border-radius:12px; padding:11px 12px; font:14px Arial, sans-serif; outline:none;
+}
+textarea { min-height:130px; resize:vertical; line-height:1.45; }
+#edit-instruction { min-height:92px; }
+.help { color:var(--muted); font-size:12px; line-height:1.45; }
+.status { min-height:22px; color:var(--ok); font-size:13px; line-height:1.45; }
+.slides-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(190px,1fr)); gap:12px; margin-top:18px; }
+.slide-card { border:1px solid rgba(139,92,246,.22); background:#100821; border-radius:14px; overflow:hidden; cursor:pointer; transition:.2s; }
+.slide-card:hover { transform:translateY(-2px); border-color:var(--border); }
+.slide-card.active { border-color:var(--accent); box-shadow:0 0 0 2px rgba(139,92,246,.28); }
+.thumb { min-height:126px; padding:14px; background:linear-gradient(150deg,#0d1117,#1a1035); position:relative; }
+.num { position:absolute; top:8px; right:10px; font-size:11px; color:rgba(255,255,255,.38); font-weight:900; }
+.badge { font-size:10px; color:#c4b5fd; font-weight:900; text-transform:uppercase; margin-bottom:8px; letter-spacing:.05em; }
+.thumb-title { font-weight:900; font-size:13px; line-height:1.25; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }
+.thumb-text { margin-top:8px; color:rgba(255,255,255,.54); font-size:10px; line-height:1.35; display:-webkit-box; -webkit-line-clamp:4; -webkit-box-orient:vertical; overflow:hidden; }
+.slide-foot { padding:9px 12px; display:flex; justify-content:space-between; gap:8px; color:var(--muted); font-size:11px; border-top:1px solid rgba(139,92,246,.16); }
+.density.ok { color:#86efac; } .density.mid { color:#fed7aa; } .density.bad { color:#fca5a5; }
+.issue-list { margin:10px 0 0; padding-left:18px; color:var(--muted); font-size:13px; line-height:1.45; }
+@media(max-width:900px){ body{padding:18px}.layout{grid-template-columns:1fr}.top{display:block}.actions{justify-content:flex-start;margin-top:14px}.qa{grid-template-columns:1fr}.score{height:64px;min-width:64px;font-size:22px}.preview-columns,.preview-stats{grid-template-columns:1fr} }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="top">
+    <div>
+      <h1>__TITLE__</h1>
+      <div class="meta">
+        Источник генерации: <strong>__SOURCE__</strong><br>
+        Проверка второй моделью: <strong>__REVIEW_SOURCE__</strong>
+      </div>
+    </div>
+    <div class="actions">
+      <a class="btn" id="download-btn" href="/api/download/__SESSION_ID__">⬇ Скачать текущий PPTX</a>
+      <a class="btn secondary" href="/">Создать ещё</a>
+    </div>
+  </div>
+
+  <div class="notice" id="warning">__WARNING__</div>
+
+  <div class="qa" id="qa-panel">
+    <div>
+      <strong>QA-отчёт</strong>
+      <div class="meta" id="qa-summary">Проверка структуры, достоверности, плотности текста и визуального баланса.</div>
+      <ul class="issue-list" id="qa-issues"></ul>
+    </div>
+    <div class="score" id="qa-score">—</div>
+  </div>
+
+  <div class="layout">
+    <div class="card">
+      <div class="preview-toolbar">
+        <span id="preview-counter">Слайд 1</span>
+        <span>Предпросмотр выбранного слайда</span>
+      </div>
+      <div class="preview-slide" id="preview-slide"></div>
+    </div>
+
+    <div class="card editor">
+      <label>Заголовок выбранного слайда</label>
+      <input id="edit-title" placeholder="Заголовок">
+      <label>Текст / пункты / цитата</label>
+      <textarea id="edit-body" placeholder="Каждый пункт — с новой строки"></textarea>
+      <label>Инструкция второй LLM для точечной правки</label>
+      <textarea id="edit-instruction" placeholder="Например: сократи текст, сделай слайд красивее, проверь цифры по документу, поправь структуру"></textarea>
+      <label>RT-токен для правки, если сервер потерял исходный токен</label>
+      <input id="edit-token" placeholder="Оставьте пустым, если токен вводили при генерации">
+      <div class="help">
+        «Сохранить вручную» пересобирает PPTX только с вашими изменениями выбранного слайда.
+        «Проверить и исправить LLM» отправляет во вторую модель только выбранный слайд, без регенерации всей презентации.
+      </div>
+      <button class="secondary" id="save-manual" onclick="saveSelectedSlide(false)">💾 Сохранить вручную</button>
+      <button id="save-llm" onclick="saveSelectedSlide(true)">🧠 Проверить и исправить LLM</button>
+      <div class="status" id="edit-status"></div>
+    </div>
+  </div>
+
+  <div class="slides-grid" id="slides-grid"></div>
+</div>
+
+<script>
+const sessionId = "__SESSION_ID__";
+let currentStyle = "__STYLE__";
+let currentSlides = __SLIDES_JSON__;
+let qualityReview = __REVIEW_JSON__;
+let activeIndex = 0;
+
+const labels = {
+  title:"Титульный", content:"Контент", two_column:"Два столбца",
+  stats:"Статистика", quote:"Цитата", section_break:"Раздел",
+  conclusion:"Заключение", image:"Изображение"
+};
+
+function escapeHtml(value) {
+  return String(value ?? '').replace(/[&<>"']/g, ch => ({
+    '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'
+  }[ch]));
+}
+
+function bodyFromSlide(slide) {
+  if (!slide) return '';
+  if (slide.layout === 'title') return slide.subtitle || '';
+  if (slide.layout === 'quote') return slide.quote || slide.content || '';
+  if (slide.layout === 'conclusion' || slide.layout === 'section_break') return slide.content || slide.subtitle || '';
+  if (slide.layout === 'stats') return slide.content || '';
+  if (slide.layout === 'two_column') return [...(slide.leftContent || []), ...(slide.rightContent || [])].join('\\n');
+  if (slide.bullets && slide.bullets.length) return slide.bullets.join('\\n');
+  return slide.content || slide.subtitle || slide.quote || '';
+}
+
+function slideBodyHtml(s) {
+  if (!s) return '';
+  if (s.stats && s.stats.length) {
+    return `<div class="preview-stats">${s.stats.slice(0,3).map(st =>
+      `<div class="preview-stat"><strong>${escapeHtml(st.value)}</strong><span>${escapeHtml(st.label)}</span></div>`
+    ).join('')}</div><p>${escapeHtml(s.content || '')}</p>`;
+  }
+  if (s.layout === 'two_column') {
+    return `<div class="preview-columns">
+      <div class="preview-column"><h3>${escapeHtml(s.leftTitle || 'Блок 1')}</h3><ul>${(s.leftContent || []).map(x => `<li>${escapeHtml(x)}</li>`).join('')}</ul></div>
+      <div class="preview-column"><h3>${escapeHtml(s.rightTitle || 'Блок 2')}</h3><ul>${(s.rightContent || []).map(x => `<li>${escapeHtml(x)}</li>`).join('')}</ul></div>
+    </div>`;
+  }
+  if (s.bullets && s.bullets.length) {
+    return `<ul>${s.bullets.map(x => `<li>${escapeHtml(x)}</li>`).join('')}</ul>`;
+  }
+  return `<p>${escapeHtml(s.quote || s.content || s.subtitle || '')}</p>`;
+}
+
+function densityClass(slide) {
+  const ratio = Number(slide?.density?.ratio || 0);
+  if (ratio > 1.12) return 'bad';
+  if (ratio > 0.86) return 'mid';
+  return 'ok';
+}
+
+function renderQa() {
+  const score = qualityReview?.score ?? '—';
+  document.getElementById('qa-score').textContent = score;
+  document.getElementById('qa-summary').textContent = qualityReview?.summary || 'Проверка выполнена.';
+  const issues = Array.isArray(qualityReview?.issues) ? qualityReview.issues.slice(0, 8) : [];
+  document.getElementById('qa-issues').innerHTML = issues.length
+    ? issues.map(x => `<li>Слайд ${escapeHtml(x.slide || '?')}: ${escapeHtml(x.issue || x)}</li>`).join('')
+    : '<li>Критичных проблем не найдено.</li>';
+}
+
+function renderCards() {
+  const grid = document.getElementById('slides-grid');
+  grid.innerHTML = '';
+  currentSlides.forEach((slide, idx) => {
+    const card = document.createElement('div');
+    card.className = 'slide-card' + (idx === activeIndex ? ' active' : '');
+    card.onclick = () => selectSlide(idx);
+    const body = slide.plain_text || bodyFromSlide(slide);
+    const ratio = slide?.density?.ratio ?? 0;
+    card.innerHTML = `
+      <div class="thumb">
+        <div class="num">${idx + 1}</div>
+        <div class="badge">${labels[slide.layout] || slide.layout || 'Слайд'}</div>
+        <div class="thumb-title">${escapeHtml(slide.title || ('Слайд ' + (idx + 1)))}</div>
+        <div class="thumb-text">${escapeHtml(body)}</div>
+      </div>
+      <div class="slide-foot">
+        <span>${slide.hasImage ? '🖼 image' : 'text'}</span>
+        <span class="density ${densityClass(slide)}">density ${escapeHtml(ratio)}</span>
+      </div>`;
+    grid.appendChild(card);
+  });
+}
+
+function selectSlide(index) {
+  activeIndex = Math.max(0, Math.min(currentSlides.length - 1, Number(index) || 0));
+  const slide = currentSlides[activeIndex];
+  document.getElementById('preview-counter').textContent = `Слайд ${activeIndex + 1} из ${currentSlides.length}`;
+  document.getElementById('preview-slide').innerHTML = `<h2>${escapeHtml(slide.title || ('Слайд ' + (activeIndex + 1)))}</h2>${slideBodyHtml(slide)}`;
+  document.getElementById('edit-title').value = slide.title || '';
+  document.getElementById('edit-body').value = bodyFromSlide(slide);
+  document.getElementById('edit-instruction').value = '';
+  renderCards();
+}
+
+async function saveSelectedSlide(useLLM) {
+  const status = document.getElementById('edit-status');
+  const btnManual = document.getElementById('save-manual');
+  const btnLlm = document.getElementById('save-llm');
+  const selected = currentSlides[activeIndex];
+  if (!selected) return;
+  btnManual.disabled = true;
+  btnLlm.disabled = true;
+  status.textContent = useLLM ? 'Отправляем выбранный слайд во вторую LLM...' : 'Сохраняем выбранный слайд и пересобираем PPTX...';
+
+  try {
+    const resp = await fetch(`/api/session/${encodeURIComponent(sessionId)}/slide/${activeIndex + 1}/edit`, {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({
+        title: document.getElementById('edit-title').value,
+        body: document.getElementById('edit-body').value,
+        instruction: useLLM ? document.getElementById('edit-instruction').value : '',
+        use_llm: !!useLLM,
+        rt_token: document.getElementById('edit-token').value
+      })
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(data.detail || 'Не удалось обновить слайд');
+    currentSlides = data.preview || currentSlides;
+    qualityReview = data.quality_review || qualityReview;
+    document.getElementById('download-btn').href = `/api/download/${sessionId}?t=${Date.now()}`;
+    renderQa();
+    selectSlide(Math.min(activeIndex, currentSlides.length - 1));
+    const report = data.slide_review?.source ? ` Источник: ${data.slide_review.source}.` : '';
+    status.textContent = 'Готово: обновлён только выбранный слайд, PPTX пересобран.' + report;
+  } catch (err) {
+    status.textContent = 'Ошибка: ' + (err.message || String(err));
+  } finally {
+    btnManual.disabled = false;
+    btnLlm.disabled = false;
+  }
+}
+
+(function init() {
+  const warning = __WARNING_JSON__;
+  if (warning.trim()) {
+    const node = document.getElementById('warning');
+    node.style.display = 'block';
+    node.textContent = warning;
+  }
+  renderQa();
+  renderCards();
+  selectSlide(0);
+})();
+</script>
+</body>
+</html>"""
+    return (
+        html
+        .replace("__SESSION_ID__", safe_session)
+        .replace("__TITLE__", safe_title)
+        .replace("__SOURCE__", _xml_text(source))
+        .replace("__REVIEW_SOURCE__", _xml_text(review_source))
+        .replace("__WARNING__", _xml_text(warning))
+        .replace("__WARNING_JSON__", warning_json)
+        .replace("__STYLE__", _xml_text(style))
+        .replace("__SLIDES_JSON__", slides_json)
+        .replace("__REVIEW_JSON__", review_json)
+    )
 
 def render_loading_page(job_id: str) -> str:
     safe_job_id = _xml_text(job_id)
@@ -721,8 +1887,8 @@ a{{color:#c4b5fd}}
   <div class="bar"><div class="fill" id="fill"></div></div>
   <div class="steps">
     <div class="step" id="s1">Чтение документа и параметров</div>
-    <div class="step" id="s2">Генерация структуры слайдов через LLM</div>
-    <div class="step" id="s3">Подготовка изображений и оформления</div>
+    <div class="step" id="s2">Генерация структуры и QA-проверка второй LLM</div>
+    <div class="step" id="s3">Правка структуры, текста и визуального баланса</div>
     <div class="step" id="s4">Сборка PPTX и страницы результата</div>
   </div>
   <div class="error" id="error"></div>
@@ -875,28 +2041,152 @@ async def rebuild_pptx(session_id: str, request: Request):
     try:
         payload = await request.json()
         slides = payload.get("slides")
-        style = payload.get("style", "modern")
-        title = payload.get("title", "Презентация")
+        existing = {}
+        try:
+            existing = load_session_structure(session_id)
+        except HTTPException:
+            existing = {}
+
+        context = _session_context(existing, session_id) if existing else {}
+        style = payload.get("style") or context.get("style") or "modern"
+        title = payload.get("title") or existing.get("presentation_title") or "Презентация"
         if not isinstance(slides, list) or not slides:
             raise HTTPException(400, "Нет данных слайдов для пересборки")
 
-        structure = {
+        old_slides = existing.get("slides", []) if isinstance(existing.get("slides"), list) else []
+        merged_slides = []
+        for idx, slide in enumerate(slides):
+            merged = copy.deepcopy(slide)
+            if idx < len(old_slides):
+                old = old_slides[idx]
+                if old.get("imageData") and not merged.get("imageData"):
+                    merged["imageData"] = old.get("imageData")
+                if old.get("image_prompt") and not merged.get("image_prompt"):
+                    merged["image_prompt"] = old.get("image_prompt")
+            cleaned, _, _ = _sanitize_slide_for_quality(
+                merged, idx, len(slides), _doc_keyword_set(context.get("document_excerpt", "")), context.get("document_excerpt", "")
+            )
+            merged_slides.append(cleaned)
+
+        structure = copy.deepcopy(existing) if existing else {}
+        structure.update({
             "presentation_title": title,
             "metadata": {"title": title, "author": "PresentAI", "contact": ""},
-            "slides": slides,
-        }
-        output_path = str(WORK_DIR / f"{session_id}.pptx")
-        if not build_pptx(structure, output_path, style):
-            raise HTTPException(500, "Ошибка пересборки PPTX")
+            "slides": merged_slides,
+        })
+        structure.setdefault("_presentai_context", {})
+        structure["_presentai_context"].update({
+            "style": style,
+            "slide_count": len(merged_slides),
+            "document_excerpt": context.get("document_excerpt", ""),
+            "prompt": context.get("prompt", ""),
+            "tone": context.get("tone", "professional"),
+        })
 
-        with open(WORK_DIR / f"{session_id}.json", "w", encoding="utf-8") as f:
-            json.dump(structure, f, ensure_ascii=False, indent=2)
+        save_session_structure(session_id, structure, style)
 
         return JSONResponse({
             "session_id": session_id,
             "title": title,
-            "slide_count": len(slides),
-            "preview": build_preview(slides),
+            "slide_count": len(merged_slides),
+            "preview": build_preview(merged_slides),
+            "quality_review": structure.get("quality_review", {}),
+            "style": style,
+        })
+    except HTTPException:
+        raise
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(500, str(e))
+
+
+@app.get("/api/session/{session_id}")
+async def get_session(session_id: str):
+    structure = load_session_structure(session_id)
+    slides = structure.get("slides", []) or []
+    context = _session_context(structure, session_id)
+    return JSONResponse({
+        "session_id": session_id,
+        "title": structure.get("presentation_title", "Презентация"),
+        "slide_count": len(slides),
+        "preview": build_preview(slides),
+        "source": structure.get("generation_source", ""),
+        "warning": " ".join(x for x in [structure.get("generation_warning", ""), structure.get("review_warning", "")] if x).strip(),
+        "review_source": structure.get("review_source", ""),
+        "quality_review": structure.get("quality_review", {}),
+        "style": context.get("style", "modern"),
+    })
+
+
+@app.post("/api/session/{session_id}/slide/{slide_index}/edit")
+async def edit_session_slide(session_id: str, slide_index: int, request: Request):
+    try:
+        payload = await request.json()
+        structure = load_session_structure(session_id)
+        slides = structure.get("slides", [])
+        if not isinstance(slides, list) or not slides:
+            raise HTTPException(400, "В сессии нет слайдов")
+        idx = slide_index - 1
+        if idx < 0 or idx >= len(slides):
+            raise HTTPException(404, "Слайд не найден")
+
+        context = _session_context(structure, session_id)
+        style = payload.get("style") or context.get("style") or "modern"
+        doc_text = context.get("document_excerpt", "")
+        runtime_token = SESSION_SECRETS.get(session_id, {}).get("rt_token", "")
+        rt_token = (payload.get("rt_token") or "").strip() or runtime_token
+
+        # First apply manual fields from the editor to the selected slide only.
+        slides[idx] = _slide_from_editor_payload(slides[idx], payload, idx, len(slides))
+        structure["slides"] = slides
+
+        instruction = _clean_text(payload.get("instruction") or "")
+        use_llm = bool(payload.get("use_llm"))
+        if use_llm:
+            structure, slide_report = edit_single_slide_with_reviewer(
+                structure, idx, instruction, rt_token, doc_text
+            )
+        else:
+            structure, slide_report = edit_single_slide_with_reviewer(
+                structure, idx, "", "", doc_text
+            )
+
+        # Update QA metadata without touching other slides.
+        old_review = structure.get("quality_review") if isinstance(structure.get("quality_review"), dict) else {}
+        old_issues = [x for x in (old_review.get("issues") or []) if not (isinstance(x, dict) and x.get("slide") == slide_index)]
+        slide_issues = []
+        for issue in slide_report.get("issues", []) or []:
+            if isinstance(issue, dict):
+                slide_issues.append(issue)
+            else:
+                slide_issues.append({"slide": slide_index, "severity": "low", "issue": str(issue), "fix": ""})
+        slide_fixes = [str(x) for x in (slide_report.get("fixes") or [])]
+        structure["quality_review"] = {
+            "source": slide_report.get("source") or old_review.get("source") or "Редактор слайда",
+            "score": old_review.get("score", 90),
+            "summary": f"Слайд {slide_index} обновлён отдельно; остальная презентация не регенерировалась.",
+            "issues": (old_issues + slide_issues)[:50],
+            "corrections": (old_review.get("corrections") or [])[:35] + slide_fixes[:15],
+        }
+        structure.setdefault("_presentai_context", {})
+        structure["_presentai_context"].update({
+            "style": style,
+            "document_excerpt": doc_text,
+            "prompt": context.get("prompt", ""),
+            "tone": context.get("tone", "professional"),
+            "slide_count": len(structure.get("slides", [])),
+        })
+
+        save_session_structure(session_id, structure, style)
+
+        return JSONResponse({
+            "session_id": session_id,
+            "title": structure.get("presentation_title", "Презентация"),
+            "slide_count": len(structure.get("slides", [])),
+            "preview": build_preview(structure.get("slides", [])),
+            "quality_review": structure.get("quality_review", {}),
+            "slide_review": slide_report,
+            "style": style,
         })
     except HTTPException:
         raise
@@ -951,13 +2241,17 @@ async def result_page(session_id: str):
     with open(json_path, "r", encoding="utf-8") as f:
         structure = json.load(f)
     slides = structure.get("slides", [])
+    context = _session_context(structure, session_id)
     return render_result_page({
         "session_id": session_id,
         "title": structure.get("presentation_title", "Презентация"),
         "slide_count": len(slides),
         "preview": build_preview(slides),
-        "warning": structure.get("generation_warning", ""),
+        "warning": " ".join(x for x in [structure.get("generation_warning", ""), structure.get("review_warning", "")] if x).strip(),
         "source": structure.get("generation_source", ""),
+        "review_source": structure.get("review_source", ""),
+        "quality_review": structure.get("quality_review", {}),
+        "style": context.get("style", "rostelecom"),
     })
 
 
@@ -1295,6 +2589,51 @@ input[type="range"]::-moz-range-thumb {
   box-shadow: 0 0 10px rgba(139,92,246,0.5);
 }
 .toggle-label { font-size: 14px; color: var(--text); font-weight: 700; }
+
+/* ── Tone cards ─────────────────────────────────────── */
+.tone-grid {
+  display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px;
+}
+@media (max-width: 640px) { .tone-grid { grid-template-columns: repeat(3, 1fr); } }
+.tone-card input { display: none; }
+.tone-card label {
+  display: flex; flex-direction: column; align-items: center; gap: 4px;
+  padding: 12px 6px; border-radius: 12px; border: 1px solid var(--border);
+  cursor: pointer; transition: all 0.2s; text-align: center;
+  background: var(--panel); margin: 0;
+}
+.tone-card label:hover { border-color: var(--border-bright); background: rgba(139,92,246,0.06); }
+.tone-card input:checked + label {
+  border-color: var(--accent-a); background: rgba(139,92,246,0.14);
+  box-shadow: 0 0 14px rgba(139,92,246,0.22);
+}
+.tone-icon { font-size: 22px; }
+.tone-name { font-size: 12px; font-weight: 700; color: var(--text); }
+.tone-desc { font-size: 10px; color: var(--muted); line-height: 1.3; }
+
+/* ── Theme cards ─────────────────────────────────────── */
+.theme-grid {
+  display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px;
+}
+@media (max-width: 600px) { .theme-grid { grid-template-columns: repeat(2, 1fr); } }
+.theme-card input { display: none; }
+.theme-card > label {
+  display: flex; flex-direction: column; border-radius: 12px;
+  border: 1px solid var(--border); overflow: hidden;
+  cursor: pointer; transition: all 0.2s; margin: 0;
+}
+.theme-card > label:hover {
+  border-color: var(--border-bright); transform: translateY(-2px);
+  box-shadow: 0 6px 20px rgba(0,0,0,0.25);
+}
+.theme-card input:checked + label {
+  border-color: var(--accent-a);
+  box-shadow: 0 0 0 2px rgba(139,92,246,0.35), 0 6px 20px rgba(0,0,0,0.3);
+}
+.theme-preview { height: 56px; width: 100%; flex-shrink: 0; }
+.theme-card-info { padding: 9px 12px; background: var(--panel); }
+.theme-card-name { font-size: 13px; font-weight: 700; color: var(--text); }
+.theme-card-desc { font-size: 10px; color: var(--muted); margin-top: 2px; }
 
 /* ── Button ──────────────────────────────────────────── */
 .btn-generate {
@@ -1650,51 +2989,72 @@ footer strong { color: var(--accent-a); }
       </script>
     </div>
 
-    <div class="fields-row">
-      <div class="field">
-        <label>Тон</label>
-        <select id="tone" name="tone">
-          <option value="professional">Профессиональный</option>
-          <option value="creative">Творческий</option>
-          <option value="academic">Академический</option>
-          <option value="casual">Дружелюбный</option>
-          <option value="persuasive">Убедительный</option>
-        </select>
-      </div>
-      <div class="field">
-        <label>Визуальный стиль</label>
-        <select id="style" name="style">
-          <option value="modern">Modern Dark</option>
-          <option value="rostelecom" selected>Ростелеком</option>
-          <option value="corporate">Corporate</option>
-          <option value="minimal">Minimal</option>
-          <option value="tech">Tech Green</option>
-        </select>
+    <div class="field">
+      <label>Тон подачи</label>
+      <div class="tone-grid">
+        <div class="tone-card">
+          <input type="radio" name="tone" id="t-professional" value="professional" checked>
+          <label for="t-professional"><span class="tone-icon">👔</span><span class="tone-name">Деловой</span><span class="tone-desc">строго и чётко</span></label>
+        </div>
+        <div class="tone-card">
+          <input type="radio" name="tone" id="t-creative" value="creative">
+          <label for="t-creative"><span class="tone-icon">🎨</span><span class="tone-name">Творческий</span><span class="tone-desc">образно и ярко</span></label>
+        </div>
+        <div class="tone-card">
+          <input type="radio" name="tone" id="t-academic" value="academic">
+          <label for="t-academic"><span class="tone-icon">🎓</span><span class="tone-name">Академический</span><span class="tone-desc">точно и строго</span></label>
+        </div>
+        <div class="tone-card">
+          <input type="radio" name="tone" id="t-casual" value="casual">
+          <label for="t-casual"><span class="tone-icon">💬</span><span class="tone-name">Дружелюбный</span><span class="tone-desc">просто и понятно</span></label>
+        </div>
+        <div class="tone-card">
+          <input type="radio" name="tone" id="t-persuasive" value="persuasive">
+          <label for="t-persuasive"><span class="tone-icon">⚡</span><span class="tone-name">Убедительный</span><span class="tone-desc">мощно и динамично</span></label>
+        </div>
       </div>
     </div>
 
-    <div class="field">
-      <label>Тема презентации (шаблон слайдов)</label>
-      <div class="option-grid">
-        <div class="option-item">
-          <input type="radio" name="style-radio" id="s-rostelecom" value="rostelecom" checked onchange="document.getElementById('style').value=this.value">
-          <label for="s-rostelecom"><span class="emoji">🚀</span>Ростелеком</label>
+      <label>Визуальная тема</label>
+      <div class="theme-grid">
+        <div class="theme-card">
+          <input type="radio" name="style" id="s-rostelecom" value="rostelecom" checked>
+          <label for="s-rostelecom">
+            <div class="theme-preview" style="background:linear-gradient(160deg,#0A0F1E 0%,#1A0A3E 100%);border-top:4px solid #7700FF"></div>
+            <div class="theme-card-info"><div class="theme-card-name">Ростелеком</div><div class="theme-card-desc">Тёмный · фиолетовый акцент</div></div>
+          </label>
         </div>
-        <div class="option-item">
-          <input type="radio" name="style-radio" id="s-modern" value="modern" onchange="document.getElementById('style').value=this.value">
-          <label for="s-modern"><span class="emoji">🌙</span>Modern Dark</label>
+        <div class="theme-card">
+          <input type="radio" name="style" id="s-modern" value="modern">
+          <label for="s-modern">
+            <div class="theme-preview" style="background:linear-gradient(160deg,#0F172A 0%,#1E3A5F 100%);border-top:4px solid #38BDF8"></div>
+            <div class="theme-card-info"><div class="theme-card-name">Modern Dark</div><div class="theme-card-desc">Тёмный · голубой акцент</div></div>
+          </label>
         </div>
-        <div class="option-item">
-          <input type="radio" name="style-radio" id="s-corporate" value="corporate" onchange="document.getElementById('style').value=this.value">
-          <label for="s-corporate"><span class="emoji">🏢</span>Corporate</label>
+        <div class="theme-card">
+          <input type="radio" name="style" id="s-corporate" value="corporate">
+          <label for="s-corporate">
+            <div class="theme-preview" style="background:linear-gradient(160deg,#F1F5F9 0%,#DBEAFE 100%);border-top:4px solid #2563EB"></div>
+            <div class="theme-card-info"><div class="theme-card-name">Corporate</div><div class="theme-card-desc">Светлый · синий акцент</div></div>
+          </label>
+        </div>
+        <div class="theme-card">
+          <input type="radio" name="style" id="s-tech" value="tech">
+          <label for="s-tech">
+            <div class="theme-preview" style="background:linear-gradient(160deg,#071A0E 0%,#0D2B18 100%);border-top:4px solid #22C55E"></div>
+            <div class="theme-card-info"><div class="theme-card-name">Tech</div><div class="theme-card-desc">Тёмный · зелёный акцент</div></div>
+          </label>
         </div>
         <div class="option-item">
           <input type="radio" name="style-radio" id="s-minimal" value="minimal" onchange="document.getElementById('style').value=this.value">
           <label for="s-minimal"><span class="emoji">⬜</span>Minimal</label>
         </div>
-        <div class="option-item">
-          <input type="radio" name="style-radio" id="s-tech" value="tech" onchange="document.getElementById('style').value=this.value">
-          <label for="s-tech"><span class="emoji">💻</span>Tech</label>
+        <div class="theme-card">
+          <input type="radio" name="style" id="s-creative" value="creative">
+          <label for="s-creative">
+            <div class="theme-preview" style="background:linear-gradient(160deg,#1E0A35 0%,#3D0F52 100%);border-top:4px solid #F97316"></div>
+            <div class="theme-card-info"><div class="theme-card-name">Creative</div><div class="theme-card-desc">Тёмный · оранжевый акцент</div></div>
+          </label>
         </div>
       </div>
     </div>
@@ -1749,7 +3109,7 @@ footer strong { color: var(--accent-a); }
       <div class="progress-steps">
         <div class="progress-step" id="ps1"><div class="dot"></div>Чтение документа</div>
         <div class="progress-step" id="ps2"><div class="dot"></div>Генерация структуры слайдов</div>
-        <div class="progress-step" id="ps3"><div class="dot"></div>Создание контента</div>
+        <div class="progress-step" id="ps3"><div class="dot"></div>QA-проверка и правка слайдов</div>
         <div class="progress-step" id="ps4"><div class="dot"></div>Сборка PPTX файла</div>
       </div>
     </div>
@@ -1938,8 +3298,8 @@ async function generate() {
     const rtToken = document.getElementById('rt-token').value.trim();
     const rtService = document.getElementById('rt-service').value;
     const slideCount = document.getElementById('slide-count').value;
-    const style = document.getElementById('style').value;
-    const tone = document.getElementById('tone').value;
+    const style = document.querySelector('input[name="style"]:checked')?.value || 'rostelecom';
+    const tone  = document.querySelector('input[name="tone"]:checked')?.value  || 'professional';
     currentStyle = style;
 
     const btn = document.getElementById('gen-btn');
@@ -1956,7 +3316,7 @@ async function generate() {
 
     const loadingSteps = [
       { at: 12, emoji: '📄', title: 'Чтение входных данных', sub: 'Учитываем промпт, PDF/DOCX и параметры', done: 'ps1' },
-      { at: 34, emoji: '🧠', title: 'RT LLM формирует структуру', sub: 'Создаем заголовки, тезисы и логику слайдов', done: 'ps2' },
+      { at: 34, emoji: '🧠', title: 'RT LLM формирует структуру, QA LLM проверяет', sub: 'Создаем структуру и проверяем факты/перегруз текста', done: 'ps2' },
       { at: 62, emoji: '🎨', title: 'Готовим визуальную часть', sub: 'Обрабатываем стиль и изображения, если они включены', done: 'ps3' },
       { at: 86, emoji: '📦', title: 'Собираем PPTX', sub: 'Формируем файл презентации для скачивания', done: 'ps4' },
     ];
@@ -2214,13 +3574,11 @@ function resetForm() {
   document.getElementById('progress-percent').textContent = '0%';
 }
 
-// Sync radio buttons with select
-document.getElementById('style').addEventListener('change', function() {
-  const val = this.value;
-  currentStyle = val;
-  const radio = document.querySelector(`input[name="style-radio"][value="${val}"]`);
-  if (radio) radio.checked = true;
+// Sync currentStyle with theme radio selection
+document.querySelectorAll('input[name="style"]').forEach(r => {
+  r.addEventListener('change', () => { currentStyle = r.value; });
 });
+currentStyle = document.querySelector('input[name="style"]:checked')?.value || 'rostelecom';
 
 document.getElementById('generator-form').addEventListener('submit', function(event) {
   const prompt = document.getElementById('prompt').value.trim();
