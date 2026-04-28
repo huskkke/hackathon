@@ -857,7 +857,8 @@ def build_single_slide_edit_prompt(
 - Текст должен помещаться: заголовок до 78 символов, пункты короткие, без перегруза.
 - Не добавляй неподтвержденные цифры.
 - Сохрани image_prompt, если он есть и подходит.
-- Не возвращай imageData.
+- Если пользователь просит фото/картинку/изображение, обязательно заполни image_prompt коротким английским промптом для 16:9.
+- Не возвращай imageData: сервер сам сгенерирует файл изображения по image_prompt для выбранного слайда.
 
 Формат:
 {{
@@ -1040,61 +1041,546 @@ def generate_slide_structure(user_prompt: str, doc_text: str,
 
 # ── Image generation (RT API) ─────────────────────────────────────────────────
 
-def generate_image_rt(prompt: str, token: str, service: str = "sd") -> Optional[bytes]:
-    """Generate image using RT API (Stable Diffusion or Yandex ART)"""
+LAST_IMAGE_ERROR = ""
+
+
+def _set_image_error(message: object) -> None:
+    """Store the last image API failure so the UI can show a useful reason."""
+    global LAST_IMAGE_ERROR
+    text = _clean_text(message)
+    LAST_IMAGE_ERROR = text[:900]
+
+
+def _normalize_rt_image_service(service: object) -> str:
+    """Normalize UI/API service names to RT service identifiers used by endpoints."""
+    value = str(service or "").strip().lower().replace("-", "_").replace(" ", "")
+    if value in {"ya", "yandex", "yandexart", "yandex_art", "yaart", "арт", "yandexарт"}:
+        return "yaArt"
+    return "sd"
+
+
+def _rt_image_service_candidates(service: object) -> list[str]:
+    """RT download is strict about serviceType; try documented and common variants."""
+    normalized = _normalize_rt_image_service(service)
+    candidates: list[str] = []
+
+    def add(value: object) -> None:
+        s = str(value or "").strip()
+        if s and s not in candidates:
+            candidates.append(s)
+
+    add(normalized)
+    if normalized == "yaArt":
+        add("yaArt")
+        # The Yandex ART doc has a typo in the serviceType description, so keep
+        # an SD fallback for /download while still posting to /ya/image first.
+        add("sd")
+    else:
+        add("sd")
+        add("yaArt")
+    return candidates
+
+
+def _guess_image_mime(data: bytes) -> str:
+    """Best-effort MIME detection for images returned by RT download."""
+    data = data or b""
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if data.startswith(b"GIF87a") or data.startswith(b"GIF89a"):
+        return "image/gif"
+    if data.startswith(b"RIFF") and b"WEBP" in data[:16]:
+        return "image/webp"
+    if data.startswith(b"BM"):
+        return "image/bmp"
+    if data[:4] in (b"II*\x00", b"MM\x00*"):
+        return "image/tiff"
+    return "image/png"
+
+
+def _is_supported_image_bytes(data: bytes) -> bool:
+    data = data or b""
+    return (
+        data.startswith(b"\x89PNG\r\n\x1a\n")
+        or data.startswith(b"\xff\xd8\xff")
+        or data.startswith(b"GIF87a")
+        or data.startswith(b"GIF89a")
+        or (data.startswith(b"RIFF") and b"WEBP" in data[:16])
+        or data.startswith(b"BM")
+        or data[:4] in (b"II*\x00", b"MM\x00*")
+    )
+
+
+def _normalize_generated_image_bytes(data: bytes) -> bytes:
+    """Return bytes that python-pptx can embed, converting exotic formats to PNG."""
+    if not data:
+        return b""
+    if data.startswith(b"\x89PNG\r\n\x1a\n") or data.startswith(b"\xff\xd8\xff") or data.startswith(b"GIF87a") or data.startswith(b"GIF89a") or data.startswith(b"BM"):
+        return data
+    if _is_supported_image_bytes(data):
+        try:
+            from PIL import Image
+            out = io.BytesIO()
+            with Image.open(io.BytesIO(data)) as im:
+                if im.mode not in ("RGB", "RGBA"):
+                    im = im.convert("RGBA")
+                im.save(out, format="PNG")
+            return out.getvalue()
+        except Exception:
+            return data
+    return b""
+
+
+def _image_bytes_from_text(text: object) -> bytes:
+    """Extract a real image from data URLs or raw base64 strings."""
+    if not isinstance(text, str):
+        return b""
+    value = text.strip()
+    if not value:
+        return b""
+    if value.startswith("data:image/") or value.startswith("image/"):
+        raw = value.split(",", 1)[1] if "," in value else ""
+    elif len(value) > 120 and re.fullmatch(r"[A-Za-z0-9+/=\s]+", value):
+        raw = value
+    else:
+        return b""
+    raw = re.sub(r"\s+", "", raw)
     try:
-        import requests as req
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-        }
-        request_id = str(uuid.uuid4())
+        decoded = base64.b64decode(raw, validate=False)
+    except Exception:
+        return b""
+    return _normalize_generated_image_bytes(decoded)
 
-        if service == "yaArt":
-            payload = {
-                "uuid": request_id,
-                "image": {
-                    "request": prompt,
-                    "seed": int(time.time()) % 999999999,
-                    "translate": True,
-                    "model": "yandex-art",
-                    "aspect": "16:9",
-                },
-            }
-            resp = req.post(f"{RT_API_BASE}/ya/image", json=payload, headers=headers, timeout=90)
-        else:  # SD
-            payload = {
-                "uuid": request_id,
-                "sdImage": {
-                    "request": prompt,
-                    "seed": int(time.time()) % 999999999,
-                    "translate": True,
-                },
-            }
-            resp = req.post(f"{RT_API_BASE}/sd/img", json=payload, headers=headers, timeout=90)
 
-        resp.raise_for_status()
-        data = resp.json()
-        if not data or not isinstance(data, list):
-            return None
+def _image_bytes_from_json_payload(obj: object) -> bytes:
+    """RT may wrap files/base64 in JSON; recursively search for image data."""
+    if isinstance(obj, str):
+        return _image_bytes_from_text(obj)
+    if isinstance(obj, list):
+        for item in obj:
+            found = _image_bytes_from_json_payload(item)
+            if found:
+                return found
+    if isinstance(obj, dict):
+        preferred_keys = (
+            "image", "imageData", "image_data", "base64", "data", "content",
+            "file", "fileData", "bytes", "payload", "result",
+        )
+        for key in preferred_keys:
+            if key in obj:
+                found = _image_bytes_from_json_payload(obj.get(key))
+                if found:
+                    return found
+        for value in obj.values():
+            found = _image_bytes_from_json_payload(value)
+            if found:
+                return found
+    return b""
 
-        msg_id = data[0].get("message", {}).get("id")
-        if not msg_id:
-            return None
 
-        # Download the image
-        svc_type = "yaArt" if service == "yaArt" else "sd"
-        dl_url = f"{RT_API_BASE}/download?id={msg_id}&serviceType={svc_type}&imageType=png"
-        dl_resp = req.get(dl_url, headers=headers, timeout=90)
-        dl_resp.raise_for_status()
-        return dl_resp.content
+def _urls_from_json_payload(obj: object) -> list[str]:
+    """Collect URL fields from a possible JSON response from /download."""
+    urls: list[str] = []
 
-    except Exception as e:
-        print(f"Image generation failed: {e}")
+    def add(value: object) -> None:
+        if not isinstance(value, str):
+            return
+        s = value.strip()
+        if not s:
+            return
+        if s.startswith("http://") or s.startswith("https://") or s.startswith("/api/") or s.startswith("/download") or s.startswith("download"):
+            if s not in urls:
+                urls.append(s)
+
+    if isinstance(obj, str):
+        add(obj)
+    elif isinstance(obj, list):
+        for item in obj:
+            urls.extend(x for x in _urls_from_json_payload(item) if x not in urls)
+    elif isinstance(obj, dict):
+        for key in ("url", "href", "link", "download", "downloadUrl", "fileUrl", "path"):
+            add(obj.get(key))
+        for value in obj.values():
+            urls.extend(x for x in _urls_from_json_payload(value) if x not in urls)
+    return urls
+
+
+def _decode_json_bytes(data: bytes) -> object:
+    try:
+        return json.loads((data or b"").decode("utf-8", errors="replace"))
+    except Exception:
         return None
 
+
+def _extract_rt_message(data: object) -> dict:
+    """Find the nested RT message object in image generation response."""
+    if isinstance(data, dict):
+        message = data.get("message")
+        if isinstance(message, dict):
+            return message
+        for value in data.values():
+            found = _extract_rt_message(value)
+            if found:
+                return found
+    if isinstance(data, list):
+        for item in data:
+            found = _extract_rt_message(item)
+            if found:
+                return found
+    return {}
+
+
+def _short_rt_body(resp: object, limit: int = 280) -> str:
+    try:
+        text = _decode_rt_response_body(resp, limit=limit)
+    except Exception:
+        text = str(getattr(resp, "text", "") or "")[:limit]
+    return _clean_text(text)
+
+
+def _download_url_image(url: str, token: str, req_module: object) -> bytes:
+    """Download an image from a URL returned by RT JSON, preserving authorization."""
+    if not url:
+        return b""
+    from urllib.parse import urljoin
+    if url.startswith("/"):
+        full_url = "https://ai.rt.ru" + url
+    elif url.startswith("download"):
+        full_url = urljoin(RT_API_BASE.rstrip("/") + "/", url)
+    else:
+        full_url = url
+    headers = {"Authorization": f"Bearer {token}", "Accept": "image/png,image/*,*/*"}
+    try:
+        resp = req_module.get(full_url, headers=headers, timeout=60)
+        if resp.status_code >= 400:
+            _set_image_error(f"GET URL {resp.status_code}: {_short_rt_body(resp)}")
+            return b""
+        data = resp.content or b""
+        image = _normalize_generated_image_bytes(data)
+        if image:
+            return image
+        parsed = _decode_json_bytes(data)
+        if parsed is not None:
+            return _image_bytes_from_json_payload(parsed)
+    except Exception as e:
+        _set_image_error(f"GET URL error: {e}")
+    return b""
+
+
+def _image_from_download_response(resp: object, token: str, req_module: object) -> bytes:
+    """Parse a /download response as binary image, JSON-wrapped base64, or URL."""
+    content = getattr(resp, "content", b"") or b""
+    image = _normalize_generated_image_bytes(content)
+    if image:
+        return image
+
+    parsed = _decode_json_bytes(content)
+    if parsed is not None:
+        image = _image_bytes_from_json_payload(parsed)
+        if image:
+            return image
+        for url in _urls_from_json_payload(parsed)[:4]:
+            image = _download_url_image(url, token, req_module)
+            if image:
+                return image
+    return b""
+
+
+def _download_rt_image_file(
+    msg_id: object,
+    token: str,
+    service_type: object,
+    preferred_service: object,
+    req_module: object,
+) -> tuple[bytes, str]:
+    """Poll RT /download until a real image file is available."""
+    services: list[str] = []
+    for svc in [service_type, preferred_service, *_rt_image_service_candidates(service_type), *_rt_image_service_candidates(preferred_service)]:
+        normalized = _normalize_rt_image_service(svc)
+        for candidate in [str(svc or "").strip(), normalized]:
+            if candidate and candidate not in services:
+                services.append(candidate)
+    if not services:
+        services = ["sd", "yaArt"]
+
+    image_types = ["png", "jpeg", "bmp", "gif", "tiff"]
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "image/png,image/jpeg,image/*;q=0.9,application/json;q=0.6,*/*;q=0.2",
+    }
+    deadline = time.time() + 110
+    attempt = 0
+    last_error = ""
+
+    while time.time() < deadline:
+        for svc in services:
+            for image_type in image_types:
+                try:
+                    resp = req_module.get(
+                        f"{RT_API_BASE}/download",
+                        params={"id": msg_id, "serviceType": svc, "imageType": image_type},
+                        headers=headers,
+                        timeout=65,
+                    )
+                    if resp.status_code >= 400:
+                        last_error = f"download id={msg_id}, serviceType={svc}, imageType={image_type}: HTTP {resp.status_code} {_short_rt_body(resp)}"
+                        continue
+                    image = _image_from_download_response(resp, token, req_module)
+                    if image:
+                        return image, ""
+                    content_type = str(resp.headers.get("Content-Type", "")) if hasattr(resp, "headers") else ""
+                    body = _short_rt_body(resp, 220)
+                    last_error = f"download id={msg_id}, serviceType={svc}: ответ не является изображением; Content-Type={content_type}; body={body}"
+                except Exception as e:
+                    last_error = f"download id={msg_id}, serviceType={svc}: {e}"
+        attempt += 1
+        time.sleep(min(1.5 + attempt * 0.45, 5.0))
+
+    return b"", last_error or f"download id={msg_id}: файл не появился за время ожидания"
+
+
+def _post_rt_image_job(prompt: str, token: str, service: str, translate: bool, req_module: object) -> tuple[object, str, bytes, str]:
+    """Create an RT image job and return (message id, serviceType, direct image, error)."""
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json; charset=utf-8",
+        "Accept": "application/json,*/*",
+    }
+    request_id = str(uuid.uuid4())
+    seed = int(time.time() * 1000) % 2147483647
+
+    if service == "yaArt":
+        payload = {
+            "uuid": request_id,
+            "image": {
+                "request": prompt,
+                "seed": seed,
+                "translate": translate,
+                "model": "yandex-art",
+                "aspect": "16:9",
+            },
+        }
+        endpoint = f"{RT_API_BASE}/ya/image"
+    else:
+        payload = {
+            "uuid": request_id,
+            "sdImage": {
+                "request": prompt,
+                "seed": seed,
+                "translate": translate,
+            },
+        }
+        endpoint = f"{RT_API_BASE}/sd/img"
+
+    try:
+        resp = req_module.post(endpoint, json=payload, headers=headers, timeout=100)
+        if resp.status_code >= 400:
+            return None, service, b"", f"POST {endpoint} HTTP {resp.status_code}: {_short_rt_body(resp)}"
+        content = resp.content or b""
+        direct_image = _normalize_generated_image_bytes(content)
+        if direct_image:
+            return None, service, direct_image, ""
+        try:
+            data = resp.json()
+        except Exception:
+            data = _decode_json_bytes(content)
+        if data is None:
+            return None, service, b"", f"POST {endpoint}: ответ не JSON и не изображение: {_short_rt_body(resp)}"
+        direct_image = _image_bytes_from_json_payload(data)
+        if direct_image:
+            return None, service, direct_image, ""
+        message = _extract_rt_message(data)
+        msg_id = message.get("id") or message.get("messageId") or message.get("message_id")
+        returned_service = message.get("serviceType") or service
+        if not msg_id:
+            return None, returned_service, b"", f"POST {endpoint}: в ответе нет message.id; фрагмент={str(data)[:320]}"
+        return msg_id, returned_service, b"", ""
+    except Exception as e:
+        return None, service, b"", f"POST {endpoint}: {e}"
+
+
+def _prepare_image_prompt(prompt: object) -> str:
+    """Keep image prompts compact and safe for RT image endpoints."""
+    text = _clean_text(prompt)
+    if not text:
+        text = "professional realistic 16:9 editorial presentation image, high quality, no text overlay"
+    text = text.replace("\x00", " ")
+    text = re.sub(r"\s+", " ", text).strip()
+    return _clip_text(text, 900)
+
+
+def generate_image_rt(prompt: str, token: str, service: str = "sd") -> Optional[bytes]:
+    """Generate image using RT API (Stable Diffusion or Yandex ART).
+
+    The RT image APIs return a message id first, and the actual binary file must
+    be fetched from /download. In practice /download can temporarily return JSON,
+    an empty body, or use slightly different serviceType values. This function
+    follows the documented flow and applies robust fallbacks so the generated
+    image is actually embedded into preview/PPTX instead of being reported as
+    successfully requested but missing.
+    """
+    _set_image_error("")
+    token = (token or "").strip()
+    if not token:
+        _set_image_error("RT-токен не задан")
+        return None
+
+    try:
+        import requests as req
+    except Exception as e:
+        _set_image_error(f"Не удалось импортировать requests: {e}")
+        return None
+
+    image_prompt = _prepare_image_prompt(prompt)
+    requested_service = _normalize_rt_image_service(service)
+    service_order = [requested_service]
+    # Fallback to the other RT image backend when the chosen one returns no file.
+    other_service = "sd" if requested_service == "yaArt" else "yaArt"
+    if other_service not in service_order:
+        service_order.append(other_service)
+
+    errors: list[str] = []
+    for svc in service_order:
+        # The attached RT docs use translate=false. If that fails, try true once
+        # to support Russian user instructions in manual slide edits.
+        for translate in (False, True):
+            msg_id, returned_service, direct_image, post_error = _post_rt_image_job(
+                image_prompt, token, svc, translate, req
+            )
+            if direct_image:
+                return direct_image
+            if post_error:
+                errors.append(post_error)
+                continue
+            if not msg_id:
+                errors.append(f"{svc}: RT API не вернул id задания изображения")
+                continue
+
+            image, download_error = _download_rt_image_file(msg_id, token, returned_service, svc, req)
+            if image:
+                return image
+            errors.append(download_error or f"{svc}: /download не вернул файл изображения")
+
+    _set_image_error(" | ".join(x for x in errors if x) or "RT API изображений не вернул файл")
+    print(f"Image generation failed: {LAST_IMAGE_ERROR}")
+    return None
+
+
 def image_bytes_to_base64(data: bytes) -> str:
-    return "image/png;base64," + base64.b64encode(data).decode()
+    """Return a browser- and PPTX-safe data URL for generated images."""
+    data = _normalize_generated_image_bytes(data)
+    if not data:
+        return ""
+    mime = _guess_image_mime(data)
+    return f"data:{mime};base64," + base64.b64encode(data).decode()
+
+
+def _normalize_image_data_url(value: object) -> str:
+    """Accept both old `image/png;base64,...` and normal `data:image/...` formats."""
+    if not isinstance(value, str):
+        return ""
+    text = value.strip()
+    if not text:
+        return ""
+    if text.startswith("data:image/"):
+        return text
+    if text.startswith("image/") and ";base64," in text:
+        return "data:" + text
+    if text.startswith("image/") and "," in text:
+        return "data:" + text
+    if text.startswith("/") or text.startswith("http://") or text.startswith("https://"):
+        return text
+    return "data:image/png;base64," + text
+
+
+def _decode_image_data(value: object) -> bytes:
+    """Decode slide imageData safely. Returns b'' if data is missing or invalid."""
+    text = _normalize_image_data_url(value)
+    if not text or text.startswith("http") or text.startswith("/"):
+        return b""
+    raw = text.split(",", 1)[1] if "," in text else text
+    raw = re.sub(r"\s+", "", raw)
+    try:
+        decoded = base64.b64decode(raw, validate=False)
+    except Exception:
+        return b""
+    return _normalize_generated_image_bytes(decoded)
+
+
+_IMAGE_REQUEST_RE = re.compile(
+    r"(фот|фото|картин|изображ|иллюстр|визуал|логотип|logo|photo|image|picture|illustration|visual)",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_image_request(text: object) -> bool:
+    return bool(_IMAGE_REQUEST_RE.search(str(text or "")))
+
+
+def _fallback_image_prompt_for_slide(slide: dict, topic: str = "", instruction: str = "") -> str:
+    """Create a usable image prompt when the LLM did not provide image_prompt."""
+    title = _clean_text(slide.get("title") or topic or "presentation slide")
+    plain = _slide_plain_text(slide)
+    source = " ".join(x for x in [instruction, title, plain[:220], topic] if _clean_text(x))
+    source = _clip_text(source, 420)
+    return (
+        "professional realistic 16:9 editorial presentation image, "
+        f"topic: {source}, high quality, clean composition, no text overlay"
+    )
+
+
+def _ensure_slide_image_prompt(slide: dict, topic: str = "", instruction: str = "", force: bool = False) -> bool:
+    """Make sure a slide has image_prompt when image generation was requested."""
+    if not isinstance(slide, dict):
+        return False
+    if _clean_text(slide.get("image_prompt")):
+        return False
+    layout = _normalize_layout_name(slide.get("layout"))
+    if force or layout not in {"title", "conclusion", "section_break", "section"}:
+        slide["image_prompt"] = _fallback_image_prompt_for_slide(slide, topic, instruction)
+        return True
+    return False
+
+
+def _generate_slide_image_if_needed(
+    slide: dict,
+    token: str,
+    service: str,
+    topic: str = "",
+    instruction: str = "",
+    force: bool = False,
+) -> tuple[bool, str]:
+    """Generate and attach imageData for one slide only when needed."""
+    if not isinstance(slide, dict):
+        return False, "Слайд не является объектом JSON."
+    token = (token or "").strip()
+    if not token:
+        return False, "RT-токен не задан, изображение не сгенерировано."
+
+    image_requested = force or _looks_like_image_request(instruction) or bool(_clean_text(slide.get("image_prompt")))
+    if not image_requested:
+        return False, "Изображение для этого слайда не запрошено."
+
+    _ensure_slide_image_prompt(slide, topic, instruction, force=True)
+    if slide.get("imageData") and not force:
+        slide["imageData"] = _normalize_image_data_url(slide.get("imageData"))
+        return False, "На слайде уже есть изображение."
+
+    img_bytes = generate_image_rt(_clean_text(slide.get("image_prompt")), token, service or "sd")
+    if not img_bytes:
+        detail = _clean_text(LAST_IMAGE_ERROR)
+        if detail:
+            return False, f"RT API изображений не вернул файл: {detail}"
+        return False, "RT API изображений не вернул файл."
+    if not _is_supported_image_bytes(img_bytes):
+        preview = img_bytes[:120].decode("utf-8", errors="replace")
+        return False, f"RT API вернул не изображение: {preview}"
+
+    slide["imageData"] = image_bytes_to_base64(img_bytes)
+    if not slide["imageData"]:
+        return False, "Изображение получено, но не удалось подготовить его для PPTX."
+    return True, "Изображение сгенерировано и прикреплено к выбранному слайду."
 
 # ── PPTX generation ──────────────────────────────────────────────────────────
 
@@ -1305,6 +1791,41 @@ def build_pptx(slide_data: dict, output_path: str, theme: str) -> bool:
         def slide_num(sl, n):
             txt(sl, 12.1, 7.05, 1.1, 0.3, str(n), sz=11, bold=True, clr=ac_c, align='right')
 
+        def add_slide_image(sl, item, x, y, w, h, panel=True):
+            """Add slide imageData to PPTX and keep aspect ratio. Returns True on success."""
+            blob = _decode_image_data(item.get('imageData'))
+            if not blob:
+                return False
+            if not _is_supported_image_bytes(blob):
+                print('Image embed skipped: imageData is not a supported image file')
+                return False
+            if panel:
+                rect(sl, x - 0.03, y - 0.03, w + 0.06, h + 0.06, 'FFFFFF', a=8)
+            px, py, pw, ph = x, y, w, h
+            try:
+                from PIL import Image
+                with Image.open(io.BytesIO(blob)) as im:
+                    iw, ih = im.size
+                if iw > 0 and ih > 0:
+                    img_ratio = iw / ih
+                    box_ratio = w / h
+                    if img_ratio >= box_ratio:
+                        pw = w
+                        ph = w / img_ratio
+                        py = y + (h - ph) / 2
+                    else:
+                        ph = h
+                        pw = h * img_ratio
+                        px = x + (w - pw) / 2
+            except Exception as image_size_error:
+                print(f'Image size detection failed: {image_size_error}')
+            try:
+                sl.shapes.add_picture(io.BytesIO(blob), Inches(px), Inches(py), width=Inches(pw), height=Inches(ph))
+                return True
+            except Exception as embed_error:
+                print(f'Image embed failed: {embed_error}')
+                return False
+
         for idx, item in enumerate(slides_list, start=1):
             sl = prs.slides.add_slide(blank)
             layout = item.get('layout', 'content')
@@ -1312,6 +1833,7 @@ def build_pptx(slide_data: dict, output_path: str, theme: str) -> bool:
 
             _grad_bg(sl, bg_c, bg2_c)
             decor(sl)
+            image_placed = False
 
             if layout == 'title':
                 rect(sl, 0, 6.7, 13.333, 0.8, ac_c,  a=85)
@@ -1382,24 +1904,17 @@ def build_pptx(slide_data: dict, output_path: str, theme: str) -> bool:
                 rect(sl, 0, 0, 0.23, 7.5, ac_c)
                 txt(sl, 0.5, 0.28, 12.5, 1.0, title, sz=fit_sz(title, 32, 24, 90, 2), bold=True, clr=ti_c)
                 rect(sl, 0.5, 1.3, 4.8, 0.06, ac_c, a=65)
-                image_data = item.get('imageData')
-                has_img = False
-                if image_data:
-                    try:
-                        raw = image_data.split(',', 1)[1] if ',' in image_data else image_data
-                        stream = io.BytesIO(base64.b64decode(raw))
-                        sl.shapes.add_picture(
-                            stream, Inches(8.3), Inches(1.5),
-                            width=Inches(4.7), height=Inches(3.5)
-                        )
-                        has_img = True
-                    except Exception as e:
-                        print(f'Image embed: {e}')
+                has_img = add_slide_image(sl, item, 8.3, 1.55, 4.65, 3.45, panel=True)
+                image_placed = has_img
                 bw = 7.5 if has_img else 12.6
                 bullets = item.get('bullets') or [item.get('content', '')]
                 bullet_text = '\n'.join(f'• {b}' for b in bullets if b)
                 txt(sl, 0.5, 1.55, bw, 5.5,
                     bullet_text, sz=fit_sz(bullet_text, 20, 14, 520 if not has_img else 360, 8), clr=tx_c)
+
+            if item.get('imageData') and not image_placed:
+                # Fallback placement for title/two_column/stats/quote/conclusion layouts.
+                image_placed = add_slide_image(sl, item, 9.0, 5.05, 3.7, 1.75, panel=True)
 
             slide_num(sl, idx)
 
@@ -1427,6 +1942,7 @@ def build_preview(slides: list[dict]) -> list[dict]:
             "rightContent": s.get("rightContent", []),
             "stats": s.get("stats", []),
             "image_prompt": s.get("image_prompt"),
+            "imageData": _normalize_image_data_url(s.get("imageData")) if s.get("imageData") else "",
             "hasImage": bool(s.get("imageData")),
             "density": _slide_density(s),
             "plain_text": _slide_plain_text(s),
@@ -1485,16 +2001,31 @@ def create_presentation_from_data(
     }
 
     slides = structure.get("slides", [])
+    image_warnings: list[str] = []
     if generate_images and rt_token.strip():
-        for slide in slides:
+        for idx, slide in enumerate(slides, start=1):
+            # Some LLM answers omit image_prompt even when the user enabled images.
+            # Create a deterministic fallback prompt so image generation really runs.
+            _ensure_slide_image_prompt(slide, prompt)
             if slide.get("image_prompt"):
-                img_bytes = generate_image_rt(slide["image_prompt"], rt_token.strip(), rt_service)
-                if img_bytes:
-                    slide["imageData"] = image_bytes_to_base64(img_bytes)
-                time.sleep(0.5)
+                ok, message = _generate_slide_image_if_needed(
+                    slide,
+                    rt_token.strip(),
+                    rt_service,
+                    topic=prompt,
+                    instruction="",
+                    force=False,
+                )
+                if not ok and not slide.get("imageData"):
+                    image_warnings.append(f"Слайд {idx}: {message}")
+                time.sleep(0.35)
     elif generate_images:
+        image_warnings.append("Генерация изображений включена, но RT-токен не задан.")
         for slide in slides:
             slide.pop("imageData", None)
+
+    if image_warnings:
+        structure["image_generation_warning"] = " ".join(image_warnings[:8])
 
     structure["slides"] = slides
     if not build_pptx(structure, output_path, style):
@@ -1508,7 +2039,7 @@ def create_presentation_from_data(
         "title": structure.get("presentation_title", "Презентация"),
         "slide_count": len(slides),
         "preview": build_preview(slides),
-        "warning": " ".join(x for x in [structure.get("generation_warning", ""), structure.get("review_warning", "")] if x).strip(),
+        "warning": " ".join(x for x in [structure.get("generation_warning", ""), structure.get("review_warning", ""), structure.get("image_generation_warning", "")] if x).strip(),
         "source": structure.get("generation_source", ""),
         "review_source": structure.get("review_source", ""),
         "quality_review": structure.get("quality_review", {}),
@@ -1606,6 +2137,9 @@ button:disabled { opacity:.55; cursor:wait; transform:none; }
 .preview-slide h2 { margin:0 0 18px; font-size:clamp(26px,4vw,48px); line-height:1.08; }
 .preview-slide p, .preview-slide li { font-size:clamp(14px,1.7vw,22px); color:rgba(255,255,255,.84); line-height:1.42; }
 .preview-slide ul { margin:0; padding-left:24px; display:grid; gap:8px; }
+.preview-with-image { display:grid; grid-template-columns:minmax(0,1fr) 42%; gap:18px; align-items:center; width:100%; }
+.preview-image { width:100%; max-height:100%; aspect-ratio:4/3; object-fit:contain; border-radius:14px; background:rgba(255,255,255,.06); border:1px solid rgba(255,255,255,.12); box-shadow:0 18px 42px rgba(0,0,0,.22); }
+.preview-image-only { display:grid; gap:14px; align-items:center; justify-items:center; }
 .preview-columns { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
 .preview-column { padding:14px; border-radius:12px; background:rgba(255,255,255,.07); }
 .preview-column h3 { margin:0 0 10px; color:white; }
@@ -1725,7 +2259,7 @@ function bodyFromSlide(slide) {
   return slide.content || slide.subtitle || slide.quote || '';
 }
 
-function slideBodyHtml(s) {
+function slideContentHtml(s) {
   if (!s) return '';
   if (s.stats && s.stats.length) {
     return `<div class="preview-stats">${s.stats.slice(0,3).map(st =>
@@ -1744,6 +2278,18 @@ function slideBodyHtml(s) {
   return `<p>${escapeHtml(s.quote || s.content || s.subtitle || '')}</p>`;
 }
 
+function slideImageHtml(s) {
+  if (!s || !s.imageData) return '';
+  return `<img class="preview-image" src="${escapeHtml(s.imageData)}" alt="Изображение слайда">`;
+}
+
+function slideBodyHtml(s) {
+  const body = slideContentHtml(s);
+  const image = slideImageHtml(s);
+  if (!image) return body;
+  if (!body || body === '<p></p>') return `<div class="preview-image-only">${image}</div>`;
+  return `<div class="preview-with-image"><div>${body}</div>${image}</div>`;
+}
 function densityClass(slide) {
   const ratio = Number(slide?.density?.ratio || 0);
   if (ratio > 1.12) return 'bad';
@@ -2111,7 +2657,7 @@ async def get_session(session_id: str):
         "slide_count": len(slides),
         "preview": build_preview(slides),
         "source": structure.get("generation_source", ""),
-        "warning": " ".join(x for x in [structure.get("generation_warning", ""), structure.get("review_warning", "")] if x).strip(),
+        "warning": " ".join(x for x in [structure.get("generation_warning", ""), structure.get("review_warning", ""), structure.get("image_generation_warning", "")] if x).strip(),
         "review_source": structure.get("review_source", ""),
         "quality_review": structure.get("quality_review", {}),
         "style": context.get("style", "modern"),
@@ -2133,8 +2679,13 @@ async def edit_session_slide(session_id: str, slide_index: int, request: Request
         context = _session_context(structure, session_id)
         style = payload.get("style") or context.get("style") or "modern"
         doc_text = context.get("document_excerpt", "")
+        topic = context.get("prompt", "") or structure.get("presentation_title", "")
+        rt_service = payload.get("rt_service") or context.get("rt_service") or "sd"
         runtime_token = SESSION_SECRETS.get(session_id, {}).get("rt_token", "")
         rt_token = (payload.get("rt_token") or "").strip() or runtime_token
+
+        before_image_prompt = _clean_text(slides[idx].get("image_prompt"))
+        before_had_image = bool(slides[idx].get("imageData"))
 
         # First apply manual fields from the editor to the selected slide only.
         slides[idx] = _slide_from_editor_payload(slides[idx], payload, idx, len(slides))
@@ -2150,6 +2701,39 @@ async def edit_session_slide(session_id: str, slide_index: int, request: Request
             structure, slide_report = edit_single_slide_with_reviewer(
                 structure, idx, "", "", doc_text
             )
+
+        # If the point-edit asks for an image, the LLM can only update image_prompt.
+        # The actual picture must be generated for this selected slide and embedded
+        # before the PPTX is rebuilt. This does not regenerate the whole presentation.
+        edited_slides = structure.get("slides", []) or []
+        if idx < len(edited_slides):
+            selected_slide = edited_slides[idx]
+            after_image_prompt = _clean_text(selected_slide.get("image_prompt"))
+            prompt_changed = bool(after_image_prompt and after_image_prompt != before_image_prompt)
+            image_requested = _looks_like_image_request(instruction) or prompt_changed
+            should_attach_image = bool(
+                use_llm and (image_requested or (after_image_prompt and not selected_slide.get("imageData")))
+            )
+            if should_attach_image:
+                if prompt_changed and before_had_image:
+                    selected_slide.pop("imageData", None)
+                if image_requested and not after_image_prompt:
+                    _ensure_slide_image_prompt(selected_slide, topic, instruction, force=True)
+                force_regenerate = prompt_changed or image_requested or not selected_slide.get("imageData")
+                ok, image_message = _generate_slide_image_if_needed(
+                    selected_slide,
+                    rt_token,
+                    rt_service,
+                    topic=topic,
+                    instruction=instruction,
+                    force=force_regenerate,
+                )
+                if ok:
+                    slide_report.setdefault("fixes", []).append(image_message)
+                else:
+                    slide_report.setdefault("issues", []).append(image_message)
+                edited_slides[idx] = selected_slide
+                structure["slides"] = edited_slides
 
         # Update QA metadata without touching other slides.
         old_review = structure.get("quality_review") if isinstance(structure.get("quality_review"), dict) else {}
@@ -2174,6 +2758,7 @@ async def edit_session_slide(session_id: str, slide_index: int, request: Request
             "document_excerpt": doc_text,
             "prompt": context.get("prompt", ""),
             "tone": context.get("tone", "professional"),
+            "rt_service": rt_service,
             "slide_count": len(structure.get("slides", [])),
         })
 
@@ -2247,7 +2832,7 @@ async def result_page(session_id: str):
         "title": structure.get("presentation_title", "Презентация"),
         "slide_count": len(slides),
         "preview": build_preview(slides),
-        "warning": " ".join(x for x in [structure.get("generation_warning", ""), structure.get("review_warning", "")] if x).strip(),
+        "warning": " ".join(x for x in [structure.get("generation_warning", ""), structure.get("review_warning", ""), structure.get("image_generation_warning", "")] if x).strip(),
         "source": structure.get("generation_source", ""),
         "review_source": structure.get("review_source", ""),
         "quality_review": structure.get("quality_review", {}),
@@ -2778,6 +3363,9 @@ input[type="range"]::-moz-range-thumb {
 }
 .preview-slide p, .preview-slide li { color: rgba(255,255,255,0.82); font-size: clamp(0.9rem, 2vw, 1.2rem); line-height: 1.45; }
 .preview-slide ul { padding-left: 22px; display: grid; gap: 8px; }
+.preview-with-image { display:grid; grid-template-columns:minmax(0,1fr) 42%; gap:18px; align-items:center; width:100%; }
+.preview-image { width:100%; max-height:100%; aspect-ratio:4/3; object-fit:contain; border-radius:12px; background:rgba(255,255,255,0.06); border:1px solid rgba(255,255,255,0.12); box-shadow:0 16px 38px rgba(0,0,0,0.22); }
+.preview-image-only { display:grid; gap:14px; align-items:center; justify-items:center; }
 .preview-columns { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
 .preview-column { background: rgba(255,255,255,0.06); border-radius: 10px; padding: 14px; }
 .preview-column h3 { color: #fff; margin-bottom: 10px; font-size: 1rem; }
@@ -3347,7 +3935,7 @@ async function generate() {
     }
 
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 120000);
+    const timeoutId = setTimeout(() => controller.abort(), 360000);
     const resp = await fetch('/api/generate', {
       method: 'POST',
       body: formData,
@@ -3469,7 +4057,8 @@ function buildSlideCard(s) {
   return card;
 }
 
-function slideBodyHtml(s) {
+function slideContentHtml(s) {
+  if (!s) return '';
   if (s.stats && s.stats.length) {
     return `<div class="preview-stats">${s.stats.slice(0, 3).map(st =>
       `<div class="preview-stat"><strong>${escapeHtml(st.value)}</strong><span>${escapeHtml(st.label)}</span></div>`
@@ -3488,6 +4077,18 @@ function slideBodyHtml(s) {
   return `<p>${escapeHtml(text)}</p>`;
 }
 
+function slideImageHtml(s) {
+  if (!s || !s.imageData) return '';
+  return `<img class="preview-image" src="${escapeHtml(s.imageData)}" alt="Изображение слайда">`;
+}
+
+function slideBodyHtml(s) {
+  const body = slideContentHtml(s);
+  const image = slideImageHtml(s);
+  if (!image) return body;
+  if (!body || body === '<p></p>') return `<div class="preview-image-only">${image}</div>`;
+  return `<div class="preview-with-image"><div>${body}</div>${image}</div>`;
+}
 function renderPreview(index) {
   const slide = currentSlides[index];
   if (!slide) return;
