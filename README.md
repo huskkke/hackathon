@@ -31,6 +31,8 @@ py -3 -m venv .venv
 
 Если PowerShell не разрешает запускать скрипты виртуального окружения, используйте команды выше именно через `.\.venv\Scripts\python.exe` - активация окружения не требуется.
 
+На Windows не используйте Linux-команду `.venv/bin/python`. Для PowerShell правильный путь к Python внутри окружения: `.\.venv\Scripts\python.exe`.
+
 ### Linux
 
 ```bash
@@ -77,4 +79,9 @@ export ANTHROPIC_API_KEY=...
 - `POST /api/rebuild/{session_id}` - пересборка PPTX после редактирования;
 - `GET /api/download/{session_id}` - скачивание презентации.
 
-Временные PPTX и JSON-файлы сохраняются в `/tmp/presentai`.
+Временные PPTX и JSON-файлы сохраняются в системной временной папке:
+
+- Windows: `%TEMP%\presentai`;
+- Linux/macOS: обычно `/tmp/presentai`.
+
+Папку можно переопределить через переменную окружения `PRESENTAI_WORK_DIR`.
