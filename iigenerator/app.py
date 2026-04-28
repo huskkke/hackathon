@@ -4,7 +4,7 @@ PresentAI — AI Presentation Generator
 Hackathon: Амурский Код 2026 | Кейс: Ростелеком
 """
 
-import os, uuid, json, io, time, re, base64, traceback, zipfile, tempfile
+import os, uuid, json, io, time, re, base64, traceback, zipfile
 from pathlib import Path
 from typing import Optional
 from xml.sax.saxutils import escape
@@ -17,8 +17,8 @@ import uvicorn
 
 # ── Setup ─────────────────────────────────────────────────────────────────────
 
-WORK_DIR = Path(os.getenv("PRESENTAI_WORK_DIR", str(Path(tempfile.gettempdir()) / "presentai")))
-WORK_DIR.mkdir(parents=True, exist_ok=True)
+WORK_DIR = Path("/tmp/presentai")
+WORK_DIR.mkdir(exist_ok=True)
 SCRIPT_DIR = Path(__file__).parent
 
 # RT API (optional — used if token provided)
