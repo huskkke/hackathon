@@ -1,8 +1,74 @@
 # PresentAI
 
-AI-генератор презентаций: от текстового запроса или документа до готового `.pptx`.
+> **AI-генератор презентаций:** от текстового запроса или документа до готового `.pptx` за несколько секунд.
 
-Проект принимает тему, PDF/DOCX-файл, количество слайдов, тон и визуальную тему. После этого LLM собирает структуру презентации, опционально добавляет изображения через RT API, а сервер генерирует PPTX и показывает редактируемое превью.
+🌐 **Хостинг:** [https://presentai-y64a.onrender.com/](https://presentai-y64a.onrender.com/)
+
+---
+
+## Описание продукта
+
+PresentAI — это веб-сервис, который автоматически создаёт презентации в формате `.pptx` на основе текстового промпта или загруженного документа (PDF / DOCX). Пользователь задаёт тему, количество слайдов, тон подачи и визуальную тему — LLM формирует структуру, сервер собирает готовый файл и показывает редактируемое превью прямо в браузере.
+
+Проект создан в рамках хакатона Ростелекома по кейсу «AI-генератор презентаций: от промпта до готового PPTX».
+
+---
+
+## Стек технологий
+
+| Слой | Технологии |
+|------|-----------|
+| **Backend** | Python 3.10+, FastAPI, Uvicorn |
+| **Генерация PPTX** | python-pptx |
+| **LLM** | Ростелеком LLM API (llama), Anthropic Claude (fallback) |
+| **Генерация изображений** | Stable Diffusion (RT API), Yandex ART API |
+| **Парсинг документов** | PyPDF2 / pdfplumber, python-docx |
+| **Frontend** | Jinja2-шаблоны, Vanilla JS, HTML/CSS |
+| **Хостинг** | Render.com |
+
+---
+
+## Архитектура приложения
+
+```
+Пользователь (браузер)
+        │
+        ▼
+┌─────────────────────────────────────────┐
+│              FastAPI (app.py)           │
+│                                         │
+│  GET  /               веб-интерфейс    │
+│  POST /api/generate   генерация         │
+│  GET  /result/{id}    превью + редактор │
+│  POST /api/rebuild    пересборка PPTX   │
+│  GET  /api/download   скачивание        │
+└────────────┬──────────────┬────────────┘
+             │              │
+     ┌───────▼──────┐  ┌────▼────────────┐
+     │   LLM Layer  │  │  Image Layer    │
+     │              │  │                 │
+     │ RT LLM API   │  │ Stable Diffusion│
+     │ Anthropic    │  │ Yandex ART API  │
+     │ local fallback│  │ circuit breaker │
+     └───────┬──────┘  └────┬────────────┘
+             │              │
+             ▼              ▼
+     ┌────────────────────────────┐
+     │      python-pptx           │
+     │  сборка .pptx по структуре │
+     └────────────────────────────┘
+             │
+             ▼
+     temp_files/{session_id}.pptx
+```
+
+**Ключевые решения:**
+- **Circuit breaker** — при 2 ошибках подряд image-бэкенд отключается на весь батч, PPTX собирается без изображений и без зависания
+- **Fallback-цепочка** — RT LLM → Anthropic → локальная демо-структура
+- **Автоматический fallback** изображений с Yandex ART на Stable Diffusion при недоступности сервиса
+- **Rate limit handling** — обработка HTTP 429 с паузой и повторной попыткой
+
+---
 
 ## Возможности
 
@@ -18,91 +84,110 @@ AI-генератор презентаций: от текстового запр
 - повторная сборка и скачивание готового `.pptx`;
 - отображение источника генерации и отчёта QA-проверки.
 
-## Быстрый старт
+---
 
-Нужен Python 3.10 или новее.
+## Инструкция по развёртыванию в локальном контуре
+
+### Требования
+
+- Python 3.10 или новее
+- Git
+
+### Linux / macOS
 
 ```bash
+# 1. Клонировать репозиторий
+git clone https://github.com/huskkke/hackathon.git
 cd hackathon
+
+# 2. Создать виртуальное окружение
 python3 -m venv .venv
 .venv/bin/python -m ensurepip --upgrade
 .venv/bin/python -m pip install --upgrade pip
+
+# 3. Установить зависимости
 .venv/bin/python -m pip install -r requirements.txt
+
+# 4. (Опционально) Задать API-ключи
+export ANTHROPIC_API_KEY=your_key_here
+
+# 5. Запустить сервер
 .venv/bin/python iigenerator/app.py
 ```
 
-После запуска откройте:
+### Windows PowerShell
 
-```text
+```powershell
+# 1. Клонировать репозиторий
+git clone https://github.com/huskkke/hackathon.git
+cd hackathon
+
+# 2. Создать виртуальное окружение
+py -3 -m venv .venv --upgrade-deps
+.\.venv\Scripts\python.exe -m ensurepip --upgrade
+.\.venv\Scripts\python.exe -m pip install --upgrade pip setuptools wheel
+
+# 3. Установить зависимости
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+
+# 4. (Опционально) Задать API-ключи
+$env:ANTHROPIC_API_KEY="your_key_here"
+
+# 5. Запустить сервер
+.\.venv\Scripts\python.exe iigenerator\app.py
+```
+
+После запуска откройте в браузере:
+
+```
 http://localhost:8000
 ```
 
-Если порт `8000` занят, можно запустить через `uvicorn` на другом порту:
+Если порт `8000` занят, запустите на другом:
 
 ```bash
 .venv/bin/python -m uvicorn iigenerator.app:app --host 127.0.0.1 --port 8001
 ```
 
-## Windows PowerShell
+> Если страница не обновилась после правок — нажмите `Ctrl+F5`.
 
-```powershell
-cd путь\к\папке\hackathon
-py -3 -m venv .venv --upgrade-deps
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-.\.venv\Scripts\python.exe iigenerator\app.py
-```
-
-Если окружение создалось без `pip`, выполните:
-
-```powershell
-.\.venv\Scripts\python.exe -m ensurepip --upgrade
-.\.venv\Scripts\python.exe -m pip install --upgrade pip setuptools wheel
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-```
-
-## API-ключи
-
-RT Bearer-токен можно вставить прямо в интерфейсе. Он используется для LLM и, если включена генерация изображений, для `/sd/img` или `/ya/image`.
-
-Дополнительно поддерживается Anthropic как запасной LLM-провайдер:
-
-```bash
-export ANTHROPIC_API_KEY=...
-export ANTHROPIC_MODEL=claude-sonnet-4-20250514
-```
-
-Если ключи не заданы или внешний API недоступен, приложение создаёт демо-структуру локально и показывает предупреждение в результате.
+---
 
 ## Переменные окружения
 
-- `PRESENTAI_WORK_DIR` - папка для временных `.json` и `.pptx`; по умолчанию `temp_files/`.
-- `ANTHROPIC_API_KEY` - ключ Anthropic для запасной генерации.
-- `ANTHROPIC_MODEL` - модель Anthropic; по умолчанию `claude-sonnet-4-20250514`.
-- `RT_IMAGE_MAX_IMAGES` - максимум изображений за одну генерацию; по умолчанию `20` (покрывает все слайды; от зависания защищает circuit breaker).
-- `RT_IMAGE_BATCH_TIMEOUT` - общий лимит времени на пачку изображений в секундах; по умолчанию `270`.
-- `RT_IMAGE_SINGLE_TIMEOUT` - лимит времени на одно изображение в секундах; по умолчанию `70`.
-- `RT_IMAGE_POST_TIMEOUT` - таймаут POST-запроса создания задания; по умолчанию `20`.
-- `RT_IMAGE_DOWNLOAD_REQUEST_TIMEOUT` - таймаут одного запроса `/download`; по умолчанию `20`.
-- `RT_IMAGE_ALLOW_BACKEND_FALLBACK` - fallback на второй image-backend при ошибке; **включён по умолчанию** (`1`).
-- `RT_IMAGE_RATELIMIT_PAUSE` - пауза в секундах при HTTP 429; по умолчанию `8`.
-- `RT_IMAGE_POST_RETRIES` - число повторов POST при rate limit; по умолчанию `1`.
-- `RT_IMAGE_CIRCUIT_BREAKER_THRESHOLD` - ошибок подряд до отключения бэкенда в батче; по умолчанию `2`.
+| Переменная | Описание | По умолчанию |
+|-----------|----------|-------------|
+| `ANTHROPIC_API_KEY` | Ключ Anthropic для запасной LLM-генерации | — |
+| `ANTHROPIC_MODEL` | Модель Anthropic | `claude-sonnet-4-20250514` |
+| `PRESENTAI_WORK_DIR` | Папка для временных `.json` и `.pptx` | `temp_files/` |
+| `RT_IMAGE_MAX_IMAGES` | Максимум изображений за одну генерацию | `20` |
+| `RT_IMAGE_BATCH_TIMEOUT` | Общий лимит времени на батч изображений (сек) | `270` |
+| `RT_IMAGE_SINGLE_TIMEOUT` | Лимит времени на одно изображение (сек) | `70` |
+| `RT_IMAGE_ALLOW_BACKEND_FALLBACK` | Fallback на второй image-backend при ошибке | `1` |
+| `RT_IMAGE_RATELIMIT_PAUSE` | Пауза при HTTP 429 (сек) | `8` |
+| `RT_IMAGE_CIRCUIT_BREAKER_THRESHOLD` | Ошибок подряд до отключения бэкенда в батче | `2` |
+
+---
 
 ## Основные endpoints
 
-- `GET /` - веб-интерфейс;
-- `POST /loading` - страница генерации с прогрессом;
-- `POST /api/jobs/{job_id}/run` - запуск задачи генерации;
-- `GET /result/{session_id}` - результат с предпросмотром и редактором;
-- `POST /api/generate` - JSON API для генерации структуры и PPTX;
-- `POST /api/rebuild/{session_id}` - пересборка PPTX после редактирования;
-- `POST /api/session/{session_id}/slide/{slide_index}/edit` - точечное редактирование слайда;
-- `GET /api/download/{session_id}` - скачивание презентации;
-- `GET /api/demo` - демо-PPTX без JavaScript и API-ключей.
+| Метод | Путь | Описание |
+|-------|------|----------|
+| `GET` | `/` | Веб-интерфейс |
+| `POST` | `/loading` | Страница генерации с прогрессом |
+| `POST` | `/api/jobs/{job_id}/run` | Запуск задачи генерации |
+| `GET` | `/result/{session_id}` | Результат с превью и редактором |
+| `POST` | `/api/generate` | JSON API для генерации структуры и PPTX |
+| `POST` | `/api/rebuild/{session_id}` | Пересборка PPTX после редактирования |
+| `POST` | `/api/session/{session_id}/slide/{slide_index}/edit` | Точечное редактирование слайда |
+| `GET` | `/api/download/{session_id}` | Скачивание презентации |
+| `GET` | `/api/demo` | Демо-PPTX без JavaScript и API-ключей |
 
-## Структура
+---
 
-```text
+## Структура проекта
+
+```
 hackathon/
 ├── iigenerator/
 │   ├── __init__.py
@@ -113,8 +198,16 @@ hackathon/
 └── temp_files/     # runtime-файлы, игнорируются Git
 ```
 
+---
+
+## Материалы
+
+- 🎬 **Скринкаст:** _ссылка_
+- 📊 **Презентация:** _ссылка_
+
+---
+
 ## Примечания
 
 - Токены хранятся только в памяти процесса и не записываются в JSON/PPTX.
 - Runtime-файлы и виртуальное окружение закрыты в `.gitignore`.
-- Для чистого обновления страницы после правок используйте `Ctrl+F5`.
