@@ -121,7 +121,7 @@ export ANTHROPIC_API_KEY=your_key_here
 ### Windows CMD
 
 ```CMD
-# 1. Клонироватьерированных презентаций в количестве не менее 3 штук. Презентации должны быть созданы одним и тем  репозиторий
+# 1. Клонировать репозиторий
 git clone https://github.com/huskkke/hackathon.git
 cd hackathon
 
