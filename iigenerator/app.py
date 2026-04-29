@@ -11,6 +11,9 @@ import io
 import json
 import os
 import re
+import shutil
+import subprocess
+import tempfile
 import time
 import traceback
 import uuid
@@ -143,6 +146,86 @@ def extract_text_from_docx(data: bytes) -> str:
         return "\n\n".join(paras)[:8000]
     except Exception as e:
         return f"[DOCX извлечение не удалось: {e}]"
+
+
+def _audio_suffix(filename: str, content_type: str) -> str:
+    name = (filename or "").lower()
+    suffix = Path(name).suffix
+    if suffix in {".webm", ".ogg", ".oga", ".wav", ".mp3", ".m4a", ".mp4"}:
+        return suffix
+    ctype = (content_type or "").lower()
+    if "ogg" in ctype:
+        return ".ogg"
+    if "wav" in ctype:
+        return ".wav"
+    if "mpeg" in ctype or "mp3" in ctype:
+        return ".mp3"
+    if "mp4" in ctype or "m4a" in ctype:
+        return ".m4a"
+    return ".webm"
+
+
+def transcribe_audio_bytes(data: bytes, filename: str = "", content_type: str = "") -> str:
+    if not data:
+        raise ValueError("Аудио не получено")
+    if len(data) > 15 * 1024 * 1024:
+        raise ValueError("Аудио слишком большое. Запишите фразу короче.")
+
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError("На сервере не найден ffmpeg для обработки записи")
+
+    try:
+        import speech_recognition as sr
+    except Exception:
+        raise RuntimeError("Не установлена зависимость SpeechRecognition. Выполните: .venv/bin/python -m pip install -r requirements.txt")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_dir = Path(tmp)
+        input_path = tmp_dir / f"input{_audio_suffix(filename, content_type)}"
+        wav_path = tmp_dir / "voice.wav"
+        input_path.write_bytes(data)
+
+        proc = subprocess.run(
+            [
+                ffmpeg,
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                str(input_path),
+                "-ac",
+                "1",
+                "-ar",
+                "16000",
+                "-f",
+                "wav",
+                str(wav_path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout or "").strip()
+            raise RuntimeError("Не удалось прочитать аудиозапись" + (f": {detail[:240]}" if detail else ""))
+
+        recognizer = sr.Recognizer()
+        with sr.AudioFile(str(wav_path)) as source:
+            audio = recognizer.record(source)
+
+    try:
+        text = recognizer.recognize_google(audio, language="ru-RU")
+    except sr.UnknownValueError:
+        raise ValueError("Речь не распознана. Попробуйте сказать чуть громче.")
+    except sr.RequestError as e:
+        raise RuntimeError(f"Сервис распознавания речи недоступен: {e}")
+
+    text = _clean_text(text)
+    if not text:
+        raise ValueError("Речь не распознана. Попробуйте ещё раз.")
+    return text
 
 # ── LLM: генерация структуры слайдов ─────────────────────────────────────────
 
@@ -2831,6 +2914,24 @@ async def generate_presentation(
         raise HTTPException(500, str(e))
 
 
+@app.post("/api/transcribe")
+async def transcribe_voice(audio: UploadFile = File(...)):
+    try:
+        data = await audio.read()
+        text = await asyncio.to_thread(
+            transcribe_audio_bytes,
+            data,
+            audio.filename or "",
+            audio.content_type or "",
+        )
+        return JSONResponse({"text": text})
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(500, str(e))
+
+
 @app.post("/loading", response_class=HTMLResponse)
 async def create_loading_job(
     prompt: str = Form(...),
@@ -3358,6 +3459,36 @@ header {
 
 /* ── Form elements ──────────────────────────────────── */
 label { display: block; font-size: 13px; font-weight: 600; color: var(--muted); margin-bottom: 6px; }
+.field-label-row {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 10px; margin-bottom: 6px;
+}
+.field-label-row label { margin-bottom: 0; }
+.voice-btn {
+  width: 36px; height: 36px; border-radius: 8px;
+  border: 1px solid var(--border);
+  background: rgba(139,92,246,0.12);
+  color: var(--text); cursor: pointer;
+  display: inline-flex; align-items: center; justify-content: center;
+  font-size: 16px; line-height: 1;
+  transition: border-color 0.2s, background 0.2s, box-shadow 0.2s, transform 0.2s;
+}
+.voice-btn:hover, .voice-btn:focus-visible {
+  border-color: var(--accent-a);
+  background: rgba(139,92,246,0.2);
+  outline: none;
+}
+.voice-btn.listening {
+  border-color: var(--accent-c);
+  background: rgba(34,211,238,0.16);
+  box-shadow: 0 0 0 3px rgba(34,211,238,0.12);
+}
+.voice-status {
+  min-height: 18px; margin-top: 6px;
+  font-size: 12px; color: var(--muted);
+}
+.voice-status.active { color: var(--accent-c); }
+.voice-status.error { color: var(--danger); }
 
 textarea, input[type="text"], input[type="number"], select {
   width: 100%; padding: 12px 14px;
@@ -3871,8 +4002,257 @@ footer strong { color: var(--accent-a); }
   <div class="card" id="form-section">
     <div class="card-title"><div class="icon">💬</div> Запрос и документ</div>
     <div class="field">
-      <label>Описание презентации *</label>
+      <div class="field-label-row">
+        <label for="prompt">Описание презентации *</label>
+        <button class="voice-btn" id="voice-input-btn" type="button"
+                aria-label="Голосовой ввод" title="Голосовой ввод"
+                onclick="toggleVoiceInput()">
+          🎙
+        </button>
+      </div>
       <textarea id="prompt" name="prompt" required placeholder="Например: Создай презентацию о преимуществах AI в телекоммуникациях для руководителей компании. Включи статистику, кейсы и план внедрения."></textarea>
+      <div class="voice-status" id="voice-status" aria-live="polite"></div>
+      <script>
+      (function () {
+        var voiceRecognition = null;
+        var voiceListening = false;
+        var voiceRecorder = null;
+        var voiceStream = null;
+        var voiceChunks = [];
+
+        function setVoiceStatus(message, state) {
+          var status = document.getElementById('voice-status');
+          var button = document.getElementById('voice-input-btn');
+          state = state || '';
+          if (status) {
+            status.textContent = message || '';
+            status.className = 'voice-status' + (state ? ' ' + state : '');
+          }
+          if (button) {
+            button.classList.toggle('listening', state === 'active');
+            button.setAttribute('aria-pressed', state === 'active' ? 'true' : 'false');
+            button.title = state === 'active' ? 'Остановить голосовой ввод' : 'Голосовой ввод';
+          }
+        }
+
+        function normalizeVoiceText(text) {
+          var clean = String(text || '').replace(/\\s+/g, ' ').trim();
+          if (!clean) return '';
+          return clean.charAt(0).toUpperCase() + clean.slice(1);
+        }
+
+        function dispatchInputEvent(node) {
+          if (typeof Event === 'function') {
+            node.dispatchEvent(new Event('input', { bubbles: true }));
+          } else {
+            var event = document.createEvent('Event');
+            event.initEvent('input', true, true);
+            node.dispatchEvent(event);
+          }
+        }
+
+        function appendVoiceText(text) {
+          var prompt = document.getElementById('prompt');
+          var clean = normalizeVoiceText(text);
+          if (!prompt || !clean) return;
+
+          var current = prompt.value.trim();
+          var separator = current ? (/[.!?…:;]$/.test(current) ? ' ' : '. ') : '';
+          prompt.value = current + separator + clean;
+          dispatchInputEvent(prompt);
+          prompt.focus();
+        }
+
+        function voiceErrorMessage(event) {
+          var code = event && event.error ? event.error : '';
+          if (code === 'not-allowed' || code === 'service-not-allowed') return 'Доступ к микрофону запрещён';
+          if (code === 'audio-capture') return 'Микрофон не найден';
+          if (code === 'no-speech') return 'Речь не распознана';
+          if (code === 'network') return 'Сервис распознавания недоступен';
+          return 'Голосовой ввод остановлен';
+        }
+
+        function getSpeechRecognitionCtor() {
+          return window.SpeechRecognition || window.webkitSpeechRecognition || null;
+        }
+
+        function getRecorderMimeType() {
+          var types = ['audio/webm;codecs=opus', 'audio/ogg;codecs=opus', 'audio/webm', 'audio/ogg'];
+          if (!window.MediaRecorder || !window.MediaRecorder.isTypeSupported) return '';
+          for (var i = 0; i < types.length; i++) {
+            if (window.MediaRecorder.isTypeSupported(types[i])) return types[i];
+          }
+          return '';
+        }
+
+        function stopVoiceStream() {
+          if (!voiceStream) return;
+          voiceStream.getTracks().forEach(function (track) { track.stop(); });
+          voiceStream = null;
+        }
+
+        function recordedFileName(blob) {
+          var type = blob && blob.type ? blob.type : '';
+          if (type.indexOf('ogg') !== -1) return 'voice.ogg';
+          if (type.indexOf('wav') !== -1) return 'voice.wav';
+          if (type.indexOf('mp4') !== -1 || type.indexOf('m4a') !== -1) return 'voice.m4a';
+          return 'voice.webm';
+        }
+
+        function transcribeRecordedAudio(blob) {
+          if (!blob || !blob.size) {
+            setVoiceStatus('Запись пустая. Попробуйте ещё раз.', 'error');
+            return;
+          }
+
+          setVoiceStatus('Распознаём запись...', 'active');
+          var formData = new FormData();
+          formData.append('audio', blob, recordedFileName(blob));
+
+          fetch('/api/transcribe', {
+            method: 'POST',
+            body: formData
+          })
+            .then(function (resp) {
+              return resp.json().catch(function () { return {}; }).then(function (data) {
+                if (!resp.ok) throw new Error(data.detail || 'Не удалось распознать запись');
+                return data;
+              });
+            })
+            .then(function (data) {
+              if (!data.text) throw new Error('Речь не распознана');
+              appendVoiceText(data.text);
+              setVoiceStatus('Текст добавлен из голосового ввода', '');
+            })
+            .catch(function (err) {
+              setVoiceStatus(err.message || 'Не удалось распознать запись', 'error');
+            });
+        }
+
+        function startServerVoiceRecording() {
+          if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia || !window.MediaRecorder) {
+            setVoiceStatus('Голосовой ввод недоступен в этом браузере', 'error');
+            return;
+          }
+
+          setVoiceStatus('Запрашиваем микрофон...', 'active');
+          navigator.mediaDevices.getUserMedia({ audio: true })
+            .then(function (stream) {
+              var mimeType = getRecorderMimeType();
+              var options = mimeType ? { mimeType: mimeType } : {};
+              voiceStream = stream;
+              voiceChunks = [];
+              voiceRecorder = new MediaRecorder(stream, options);
+
+              voiceRecorder.ondataavailable = function (event) {
+                if (event.data && event.data.size > 0) voiceChunks.push(event.data);
+              };
+
+              voiceRecorder.onerror = function () {
+                stopVoiceStream();
+                voiceRecorder = null;
+                setVoiceStatus('Ошибка записи с микрофона', 'error');
+              };
+
+              voiceRecorder.onstop = function () {
+                var type = voiceRecorder && voiceRecorder.mimeType ? voiceRecorder.mimeType : (mimeType || 'audio/webm');
+                var blob = new Blob(voiceChunks, { type: type });
+                voiceRecorder = null;
+                stopVoiceStream();
+                transcribeRecordedAudio(blob);
+              };
+
+              voiceRecorder.start();
+              setVoiceStatus('Идёт запись. Нажмите микрофон ещё раз, чтобы распознать.', 'active');
+            })
+            .catch(function (err) {
+              var message = err && (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError')
+                ? 'Доступ к микрофону запрещён'
+                : 'Не удалось включить микрофон';
+              setVoiceStatus(message, 'error');
+            });
+        }
+
+        function stopServerVoiceRecording() {
+          if (voiceRecorder && voiceRecorder.state === 'recording') {
+            setVoiceStatus('Отправляем запись на распознавание...', 'active');
+            voiceRecorder.stop();
+          }
+        }
+
+        function ensureVoiceRecognition() {
+          var SpeechRecognition = getSpeechRecognitionCtor();
+          if (!SpeechRecognition) return null;
+          if (voiceRecognition) return voiceRecognition;
+
+          voiceRecognition = new SpeechRecognition();
+          voiceRecognition.lang = 'ru-RU';
+          voiceRecognition.continuous = true;
+          voiceRecognition.interimResults = true;
+          voiceRecognition.maxAlternatives = 1;
+
+          voiceRecognition.onstart = function () {
+            voiceListening = true;
+            setVoiceStatus('Говорите...', 'active');
+          };
+
+          voiceRecognition.onresult = function (event) {
+            var finalText = '';
+            var interimText = '';
+            for (var i = event.resultIndex; i < event.results.length; i++) {
+              var transcript = event.results[i][0].transcript || '';
+              if (event.results[i].isFinal) finalText += transcript + ' ';
+              else interimText += transcript + ' ';
+            }
+
+            if (finalText.trim()) appendVoiceText(finalText);
+            if (interimText.trim()) setVoiceStatus('Распознаю: ' + interimText.trim(), 'active');
+            else if (voiceListening) setVoiceStatus('Говорите...', 'active');
+          };
+
+          voiceRecognition.onerror = function (event) {
+            voiceListening = false;
+            setVoiceStatus(voiceErrorMessage(event), 'error');
+          };
+
+          voiceRecognition.onend = function () {
+            var status = document.getElementById('voice-status');
+            var hasError = status && status.classList.contains('error');
+            voiceListening = false;
+            if (!hasError) setVoiceStatus('Голосовой ввод остановлен', '');
+          };
+
+          return voiceRecognition;
+        }
+
+        window.toggleVoiceInput = function () {
+          if (voiceRecorder && voiceRecorder.state === 'recording') {
+            stopServerVoiceRecording();
+            return;
+          }
+
+          var recognition = ensureVoiceRecognition();
+          if (!recognition) {
+            startServerVoiceRecording();
+            return;
+          }
+
+          if (voiceListening) {
+            voiceListening = false;
+            recognition.stop();
+            setVoiceStatus('Голосовой ввод остановлен', '');
+            return;
+          }
+
+          try {
+            setVoiceStatus('Запрашиваем микрофон...', 'active');
+            recognition.start();
+          } catch (err) {
+            startServerVoiceRecording();
+          }
+        };
+      })();
+      </script>
     </div>
     <div class="field">
       <label>Исходный документ (необязательно)</label>
