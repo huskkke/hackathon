@@ -3393,11 +3393,21 @@ select option { background: var(--panel); }
   border-color: var(--accent-a);
   background: rgba(139,92,246,0.06);
 }
-.upload-zone input { position: absolute; inset: 0; opacity: 0; cursor: pointer; }
+.upload-zone.has-file {
+  border-color: var(--accent-c);
+  background: rgba(34,211,238,0.07);
+}
+.doc-file-input {
+  position: absolute;
+  width: 1px; height: 1px;
+  opacity: 0;
+  pointer-events: none;
+}
 .upload-icon { font-size: 28px; margin-bottom: 8px; }
 .upload-text { font-size: 14px; color: var(--muted); }
 .upload-text strong { color: var(--accent-a); }
 .file-name { margin-top: 10px; font-size: 13px; color: var(--accent-c); font-weight: 600; }
+.file-name.invalid { color: var(--danger); }
 
 /* ── Toggle options ──────────────────────────────────── */
 .option-grid {
@@ -3866,15 +3876,142 @@ footer strong { color: var(--accent-a); }
     </div>
     <div class="field">
       <label>Исходный документ (необязательно)</label>
-      <div class="upload-zone" id="upload-zone">
-        <input type="file" id="doc-file" name="document" accept=".pdf,.docx" onchange="handleFileSelect(this)">
+      <input class="doc-file-input" type="file" id="doc-file" name="document" accept=".pdf,.docx" onchange="return handleDocumentInputChange(this)">
+      <label class="upload-zone" id="upload-zone" for="doc-file"
+             ondragenter="return handleDocumentDragEnter(event)"
+             ondragover="return handleDocumentDragOver(event)"
+             ondragleave="return handleDocumentDragLeave(event)"
+             ondrop="return handleDocumentDrop(event)">
         <div class="upload-icon">📄</div>
         <div class="upload-text">
           <strong>Выберите файл</strong> или перетащите сюда<br>
           PDF или DOCX — контент будет учтён при генерации
         </div>
         <div class="file-name" id="file-name-display" style="display:none"></div>
-      </div>
+      </label>
+      <script>
+      (function () {
+        window.__selectedDocumentFile = null;
+
+        function getInput() {
+          return document.getElementById('doc-file');
+        }
+
+        function getZone() {
+          return document.getElementById('upload-zone');
+        }
+
+        function getDisplay() {
+          return document.getElementById('file-name-display');
+        }
+
+        function isAllowed(file) {
+          return !!file && /\\.(pdf|docx)$/i.test(file.name || '');
+        }
+
+        function showFile(file, errorMessage) {
+          var display = getDisplay();
+          var zone = getZone();
+          if (!display || !zone) return;
+
+          display.classList.toggle('invalid', !!errorMessage);
+          if (errorMessage) {
+            display.textContent = errorMessage;
+            display.style.display = 'block';
+            zone.classList.remove('has-file');
+            return;
+          }
+
+          if (file) {
+            display.textContent = '📎 ' + file.name;
+            display.style.display = 'block';
+            zone.classList.add('has-file');
+          } else {
+            display.textContent = '';
+            display.style.display = 'none';
+            zone.classList.remove('has-file');
+          }
+        }
+
+        function putDroppedFileIntoInput(file) {
+          var input = getInput();
+          if (!input || !window.DataTransfer) return;
+          try {
+            var transfer = new DataTransfer();
+            transfer.items.add(file);
+            input.files = transfer.files;
+          } catch (err) {
+            // Некоторые браузеры не разрешают программно менять input.files.
+          }
+        }
+
+        window.getSelectedDocumentFile = function () {
+          var input = getInput();
+          return window.__selectedDocumentFile || (input && input.files && input.files[0]) || null;
+        };
+
+        window.handleDocumentInputChange = function (input) {
+          var file = input && input.files && input.files[0] ? input.files[0] : null;
+          if (file && !isAllowed(file)) {
+            input.value = '';
+            window.__selectedDocumentFile = null;
+            showFile(null, 'Можно загрузить только PDF или DOCX');
+            return false;
+          }
+
+          window.__selectedDocumentFile = file;
+          showFile(file, '');
+          return true;
+        };
+
+        window.handleDocumentDragEnter = function (event) {
+          if (event) event.preventDefault();
+          getZone().classList.add('dragover');
+          return false;
+        };
+
+        window.handleDocumentDragOver = function (event) {
+          if (event) {
+            event.preventDefault();
+            if (event.dataTransfer) event.dataTransfer.dropEffect = 'copy';
+          }
+          getZone().classList.add('dragover');
+          return false;
+        };
+
+        window.handleDocumentDragLeave = function (event) {
+          var zone = getZone();
+          if (!event || !zone.contains(event.relatedTarget)) zone.classList.remove('dragover');
+          return false;
+        };
+
+        window.handleDocumentDrop = function (event) {
+          var zone = getZone();
+          if (event) {
+            event.preventDefault();
+            event.stopPropagation();
+          }
+          zone.classList.remove('dragover');
+
+          var files = event && event.dataTransfer && event.dataTransfer.files;
+          var file = files && files.length ? files[0] : null;
+          var input = getInput();
+          if (!file) return false;
+
+          if (!isAllowed(file)) {
+            if (input) input.value = '';
+            window.__selectedDocumentFile = null;
+            showFile(null, 'Можно загрузить только PDF или DOCX');
+            return false;
+          }
+
+          window.__selectedDocumentFile = file;
+          putDroppedFileIntoInput(file);
+          showFile(file, '');
+          return false;
+        };
+      })();
+      </script>
     </div>
 
     <!-- Step 2: Settings -->
@@ -4123,30 +4260,6 @@ window.addEventListener('error', event => {
   }
 });
 
-function handleFileSelect(input) {
-  const file = input.files[0];
-  const display = document.getElementById('file-name-display');
-  if (file) {
-    display.textContent = '📎 ' + file.name;
-    display.style.display = 'block';
-  } else {
-    display.style.display = 'none';
-  }
-}
-
-// Перетаскивание документа поверх стандартного input[type=file].
-const zone = document.getElementById('upload-zone');
-zone.addEventListener('dragover', e => { e.preventDefault(); zone.classList.add('dragover'); });
-zone.addEventListener('dragleave', () => zone.classList.remove('dragover'));
-zone.addEventListener('drop', e => {
-  e.preventDefault(); zone.classList.remove('dragover');
-  const f = e.dataTransfer.files[0];
-  if (f) {
-    document.getElementById('doc-file').files = e.dataTransfer.files;
-    handleFileSelect(document.getElementById('doc-file'));
-  }
-});
-
 function toggleImages() {
   const cb = document.getElementById('gen-images');
   cb.checked = !cb.checked;
@@ -4293,8 +4406,9 @@ async function generate() {
     formData.append('rt_service', rtService);
 
     const fileInput = document.getElementById('doc-file');
-    if (fileInput.files[0]) {
-      formData.append('document', fileInput.files[0]);
+    const documentFile = (window.getSelectedDocumentFile && window.getSelectedDocumentFile()) || fileInput.files[0];
+    if (documentFile) {
+      formData.append('document', documentFile);
     }
 
     const controller = new AbortController();
